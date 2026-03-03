@@ -23,8 +23,10 @@ def test_function_run(
         automation_context,
         automate_function,
         FunctionInputs(
-            forbidden_speckle_type="None",
-            whisper_message=SecretStr("testing automatically"),
+            file_name="test_output.ifc",
+            IFC_PROJECT_NAME = "Speckle Export",
+            IFC_SITE_NAME = "Site",
+            IFC_BUILDING_NAME = "Building"
         ),
     )
 
