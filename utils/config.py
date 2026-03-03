@@ -5,7 +5,7 @@
 
 # --- Speckle Connection ---
 SPECKLE_HOST = "app.speckle.systems"   # or your self-hosted server URL
-SPECKLE_TOKEN = "40e3222fe7d82ed1796aa4ccd353f38ad098cc84dd"  # from app.speckle.systems/profile
+SPECKLE_TOKEN = "****"  # from app.speckle.systems/profile
 
 # --- Speckle Project ---
 PROJECT_ID = "d7d987146d"         # the stream/project ID from the URL
