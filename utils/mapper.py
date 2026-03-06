@@ -1,16 +1,123 @@
 # =============================================================================
 # mapper.py
-# Maps Speckle speckle_type strings and Revit category names → IFC entity classes.
+# Maps Speckle objects → IFC entity classes.
 #
-# Strategy:
-#   1. Try to match speckle_type exactly or by prefix
-#   2. Fall back to Revit category name (e.g. "Floors" → IfcSlab)
-#   3. Fall back to IfcBuildingElementProxy if nothing matches
+# Strategy (priority order):
+#   1. builtInCategory (OST_ enum from properties.builtInCategory) — most reliable
+#   2. speckle_type prefix match — for typed Speckle objects
+#   3. category_name string (traversal context) — display name fallback
+#   4. IfcBuildingElementProxy — last resort
+#
+# builtInCategory values: https://www.revitapidocs.com/2019/ba1c5b30-242f-5fdc-8ea9-ec3b61e6e722.htm
 # =============================================================================
 
 
-# --- speckle_type → IFC class ---
-# Covers Objects.BuiltElements.* from the Speckle Objects kit
+# --- OST_ BuiltInCategory → IFC class (primary lookup) ---
+BUILTIN_CATEGORY_MAP: dict[str, str] = {
+    # Architectural - Walls
+    "OST_Walls":                            "IfcWall",
+    "OST_CurtainWallPanels":                "IfcCurtainWall",
+    "OST_CurtainWallMullions":              "IfcMember",
+    "OST_Fascia":                           "IfcCovering",
+    "OST_Gutters":                          "IfcPipeSegment",
+
+    # Architectural - Floors / Roofs / Ceilings
+    "OST_Floors":                           "IfcSlab",
+    "OST_Roofs":                            "IfcRoof",
+    "OST_Ceilings":                         "IfcCovering",
+    "OST_RoofSoffit":                       "IfcCovering",
+
+    # Architectural - Doors / Windows / Openings
+    "OST_Doors":                            "IfcDoor",
+    "OST_Windows":                          "IfcWindow",
+    "OST_CurtainWallFamilies":              "IfcCurtainWall",
+    "OST_Skylights":                        "IfcWindow",
+
+    # Architectural - Stairs / Ramps / Railings
+    "OST_Stairs":                           "IfcStair",
+    "OST_StairsRailing":                    "IfcRailing",
+    "OST_Ramps":                            "IfcRamp",
+    "OST_StairsLandings":                   "IfcStairFlight",
+    "OST_StairsRuns":                       "IfcStairFlight",
+    "OST_StairsSupports":                   "IfcMember",
+
+    # Architectural - Rooms / Spaces
+    "OST_Rooms":                            "IfcSpace",
+    "OST_Parking":                          "IfcSpace",
+    "OST_Areas":                            "IfcSpace",
+
+    # Architectural - Furniture / Casework
+    "OST_Furniture":                        "IfcFurnishingElement",
+    "OST_FurnitureSystems":                 "IfcFurnishingElement",
+    "OST_Casework":                         "IfcFurnishingElement",
+    "OST_SpecialtyEquipment":               "IfcFurnishingElement",
+    "OST_Entourage":                        "IfcFurnishingElement",
+
+    # Structural
+    "OST_StructuralColumns":                "IfcColumn",
+    "OST_Columns":                          "IfcColumn",
+    "OST_StructuralFraming":                "IfcBeam",
+    "OST_StructuralFoundation":             "IfcFooting",
+    "OST_FoundationSlab":                   "IfcSlab",
+    "OST_StructuralStiffener":              "IfcMember",
+    "OST_StructuralTruss":                  "IfcMember",
+    "OST_StructuralConnectionModel":        "IfcMechanicalFastener",
+    "OST_Rebar":                            "IfcReinforcingBar",
+    "OST_FabricAreas":                      "IfcReinforcingMesh",
+    "OST_FabricReinforcement":              "IfcReinforcingMesh",
+
+    # MEP - HVAC
+    "OST_DuctCurves":                       "IfcDuctSegment",
+    "OST_DuctFitting":                      "IfcDuctFitting",
+    "OST_DuctAccessory":                    "IfcDuctSegment",
+    "OST_DuctTerminal":                     "IfcAirTerminal",
+    "OST_FlexDuctCurves":                   "IfcDuctSegment",
+    "OST_MechanicalEquipment":              "IfcUnitaryEquipment",
+    "OST_AirTerminal":                      "IfcAirTerminal",
+
+    # MEP - Plumbing
+    "OST_PipeCurves":                       "IfcPipeSegment",
+    "OST_PipeFitting":                      "IfcPipeFitting",
+    "OST_PipeAccessory":                    "IfcPipeSegment",
+    "OST_FlexPipeCurves":                   "IfcPipeSegment",
+    "OST_PlumbingFixtures":                 "IfcSanitaryTerminal",
+    "OST_Sprinklers":                       "IfcFireSuppressionTerminal",
+
+    # MEP - Electrical
+    "OST_ElectricalEquipment":              "IfcElectricDistributionBoard",
+    "OST_ElectricalFixtures":               "IfcElectricAppliance",
+    "OST_LightingFixtures":                 "IfcLightFixture",
+    "OST_LightingDevices":                  "IfcLightFixture",
+    "OST_CableTray":                        "IfcCableCarrierSegment",
+    "OST_CableTrayFitting":                 "IfcCableCarrierFitting",
+    "OST_Conduit":                          "IfcCableCarrierSegment",
+    "OST_ConduitFitting":                   "IfcCableCarrierFitting",
+    "OST_CommunicationDevices":             "IfcElectricAppliance",
+    "OST_DataDevices":                      "IfcElectricAppliance",
+    "OST_FireAlarmDevices":                 "IfcAlarm",
+    "OST_SecurityDevices":                  "IfcAlarm",
+    "OST_NurseCallDevices":                 "IfcElectricAppliance",
+
+    # Site / Civil
+    "OST_Site":                             "IfcSite",
+    "OST_Topography":                       "IfcGeographicElement",
+    "OST_Roads":                            "IfcRoad",
+    "OST_Hardscape":                        "IfcPavement",
+    "OST_Planting":                         "IfcGeographicElement",
+    "OST_SiteSurface":                      "IfcGeographicElement",
+
+    # Generic / Annotation (skip or proxy)
+    "OST_GenericModel":                     "IfcBuildingElementProxy",
+    "OST_Mass":                             "IfcBuildingElementProxy",
+    "OST_DetailComponents":                 "IfcAnnotation",
+    "OST_Lines":                            "IfcAnnotation",
+    "OST_Grids":                            "IfcGrid",
+    "OST_Levels":                           "IfcBuildingStorey",
+    "OST_Views":                            "IfcAnnotation",
+}
+
+
+# --- speckle_type → IFC class (secondary lookup) ---
 SPECKLE_TYPE_MAP: dict[str, str] = {
     "Objects.BuiltElements.Wall":                        "IfcWall",
     "Objects.BuiltElements.Floor":                       "IfcSlab",
@@ -47,7 +154,7 @@ SPECKLE_TYPE_MAP: dict[str, str] = {
     "Objects.Geometry.Brep":                             "IfcBuildingElementProxy",
 }
 
-# --- Revit category name → IFC class (fallback) ---
+# --- Display category name → IFC class (tertiary fallback) ---
 CATEGORY_MAP: dict[str, str] = {
     "Walls":                        "IfcWall",
     "Floors":                       "IfcSlab",
@@ -85,39 +192,63 @@ CATEGORY_MAP: dict[str, str] = {
     "Parking":                      "IfcSpace",
     "Generic Models":               "IfcBuildingElementProxy",
     "Mass":                         "IfcBuildingElementProxy",
-    "Specialty Equipment":          "IfcBuildingElementProxy",
+    "Specialty Equipment":          "IfcFurnishingElement",
 }
+
+
+def _get_builtin_category(obj) -> str | None:
+    """
+    Read builtInCategory from obj.properties.builtInCategory.
+    Returns the OST_ string or None.
+    """
+    try:
+        props = obj["properties"] or getattr(obj, "properties", None)
+        if props is None:
+            return None
+        if hasattr(props, "__getitem__"):
+            val = props["builtInCategory"]
+        else:
+            val = getattr(props, "builtInCategory", None)
+        if val and isinstance(val, str):
+            return val.strip()
+    except Exception:
+        pass
+    return None
 
 
 def classify(obj, category_name: str = "") -> str:
     """
     Determine the IFC class for a Speckle object.
 
-    With the new Objects.Data.DataObject:Objects.Data.RevitObject speckle_type,
-    category name is now the primary classification signal.
-
-    Args:
-        obj: A specklepy Base object (leaf element).
-        category_name: The Revit category string from the traversal context
-                       e.g. "Floors", "Walls", "Structural Columns"
-
-    Returns:
-        An IFC class name string e.g. "IfcWall"
+    Priority:
+      1. properties.builtInCategory (OST_ enum) — definitive Revit classification
+      2. speckle_type prefix match
+      3. category_name from traversal context (display string)
+      4. obj.category field
+      5. IfcBuildingElementProxy fallback
     """
-    speckle_type = getattr(obj, "speckle_type", "") or ""
+    # 1. builtInCategory — most reliable, direct Revit enum
+    bic = _get_builtin_category(obj)
+    if bic and bic in BUILTIN_CATEGORY_MAP:
+        return BUILTIN_CATEGORY_MAP[bic]
 
-    # 1. Category name — PRIMARY lookup for RevitObject types
+    # 2. speckle_type
+    speckle_type = getattr(obj, "speckle_type", "") or ""
+    if speckle_type in SPECKLE_TYPE_MAP:
+        return SPECKLE_TYPE_MAP[speckle_type]
+    for key, ifc_class in SPECKLE_TYPE_MAP.items():
+        if speckle_type.startswith(key):
+            return ifc_class
+
+    # 3. category_name from traversal context
     if category_name:
-        # Exact match
         if category_name in CATEGORY_MAP:
             return CATEGORY_MAP[category_name]
-        # Partial match handles Revit appending IDs e.g. "Structural Framing [12345]"
         for key, ifc_class in CATEGORY_MAP.items():
             if key.lower() in category_name.lower():
                 return ifc_class
 
-    # 2. Read 'category' directly off the object itself
-    # Per docs: category is a TOP-LEVEL field on RevitObject, not inside properties
+    # 4. obj.category field
     obj_category = getattr(obj, "category", None)
     if obj_category and isinstance(obj_category, str):
         if obj_category in CATEGORY_MAP:
@@ -126,12 +257,4 @@ def classify(obj, category_name: str = "") -> str:
             if key.lower() in obj_category.lower():
                 return ifc_class
 
-    # 3. speckle_type — fallback for non-RevitObject types (geometry, structural, etc.)
-    if speckle_type in SPECKLE_TYPE_MAP:
-        return SPECKLE_TYPE_MAP[speckle_type]
-    for key, ifc_class in SPECKLE_TYPE_MAP.items():
-        if speckle_type.startswith(key):
-            return ifc_class
-
-    # 4. Last resort
     return "IfcBuildingElementProxy"

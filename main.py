@@ -9,8 +9,9 @@ from utils.traversal import traverse, print_tree
 from utils.mapper import classify
 from utils.geometry import mesh_to_ifc, get_display_instances, _make_placement
 from utils.instances import is_instance, instance_to_ifc, build_definition_map, print_instance_stats
-from utils.properties import write_properties, write_common_properties
+from utils.properties import write_properties, write_common_properties, build_element_name, get_element_tag, get_ifc_guid
 from utils.writer import create_ifc_scaffold, StoreyManager
+from utils.type_manager import TypeManager
 
 
 SPATIAL_STRUCTURE_TYPES = {
@@ -59,8 +60,6 @@ def automate_function(
     print("  Speckle -> IFC4.3 Exporter")
     print("=" * 60)
 
-    #version_root_object = automate_context.receive_version()
-
     # ------------------------------------------------------------------ #
     # 1. Receive
     # ------------------------------------------------------------------ #
@@ -87,6 +86,7 @@ def automate_function(
     # ------------------------------------------------------------------ #
     print("\n🎨 Building material map...")
     material_manager = MaterialManager(ifc, base)
+    type_manager = TypeManager(ifc)
 
     # ------------------------------------------------------------------ #
     # 4. Traverse & export
@@ -106,7 +106,7 @@ def automate_function(
             skipped_spatial += 1
             continue
 
-        name   = getattr(obj, "name", None) or getattr(obj, "applicationId", None) or getattr(obj, "id", "unnamed")
+        name   = build_element_name(obj)
         storey = storey_manager.get_or_create(level_name)
 
         # ------------------------------------------------------------------ #
@@ -114,13 +114,15 @@ def automate_function(
         # ------------------------------------------------------------------ #
         if is_instance(obj):
             rep, placement = instance_to_ifc(ifc, body_context, obj, definition_map, scale=scale, material_manager=material_manager)
-            element = _create_element(ifc, ifc_class, name, rep, placement, storey)
-            write_common_properties(ifc, element, obj, category_name)
-            write_properties(ifc, element, obj)
-            instance_count += 1
-            total += 1
             if not rep:
                 no_geometry += 1
+                continue
+            element = _create_element(ifc, ifc_class, name, rep, placement, storey,
+                                         tag=get_element_tag(obj), guid=get_ifc_guid(obj))
+            write_properties(ifc, element, obj, ifc_class=ifc_class, category_name=category_name)
+            type_manager.assign(element, obj, ifc_class)
+            instance_count += 1
+            total += 1
 
         else:
             # ------------------------------------------------------------------ #
@@ -131,12 +133,12 @@ def automate_function(
 
             # B1: Mesh geometry on the parent object
             rep, placement = mesh_to_ifc(ifc, body_context, obj, scale=scale, material_manager=material_manager)
-            element = _create_element(ifc, ifc_class, name, rep, placement, storey)
-            write_common_properties(ifc, element, obj, category_name)
-            write_properties(ifc, element, obj)
-            total += 1
-            if not rep:
-                no_geometry += 1
+            if rep:
+                element = _create_element(ifc, ifc_class, name, rep, placement, storey,
+                                             tag=get_element_tag(obj), guid=get_ifc_guid(obj))
+                write_properties(ifc, element, obj, ifc_class=ifc_class, category_name=category_name)
+                type_manager.assign(element, obj, ifc_class)
+                total += 1
 
             # B2: Instance objects nested inside displayValue
             # Each becomes its own IFC element (same class as parent)
@@ -146,15 +148,20 @@ def automate_function(
                 inst_rep, inst_placement = instance_to_ifc(
                     ifc, body_context, inst, definition_map, scale=scale, material_manager=material_manager
                 )
+                if not inst_rep:
+                    no_geometry += 1
+                    continue
                 inst_element = _create_element(
                     ifc, ifc_class, name, inst_rep, inst_placement, storey
                 )
-                write_common_properties(ifc, inst_element, obj, category_name)
-                write_properties(ifc, inst_element, obj)
+                write_properties(ifc, inst_element, obj, ifc_class=ifc_class, category_name=category_name)
+                type_manager.assign(inst_element, obj, ifc_class)
                 instance_count += 1
                 total += 1
-                if not inst_rep:
-                    no_geometry += 1
+
+            # Track if neither path produced geometry
+            if not rep and not nested_instances:
+                no_geometry += 1
 
         if total % 100 == 0:
             print(f"  ... processed {total} elements")
@@ -162,6 +169,9 @@ def automate_function(
     # ------------------------------------------------------------------ #
     # 5. Write output
     # ------------------------------------------------------------------ #
+    print("\n🔗 Flushing type relationships...")
+    type_manager.flush()
+
     file_name = function_inputs.file_name
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
 
@@ -181,13 +191,20 @@ def automate_function(
     print_instance_stats()
     print(f"{'=' * 60}\n")
 
-def _create_element(ifc, ifc_class, name, rep, placement, storey):
+def _create_element(ifc, ifc_class, name, rep, placement, storey, tag=None, guid=None):
     """Helper: create an IFC element, assign geometry + placement + container."""
     element = ifcopenshell.api.run(
         "root.create_entity", ifc,
         ifc_class=ifc_class,
         name=str(name),
     )
+    if tag:
+        element.Tag = str(tag)
+    if guid:
+        try:
+            element.GlobalId = guid
+        except Exception:
+            pass
     if rep and placement:
         element.Representation = ifc.createIfcProductDefinitionShape(
             Representations=(rep,)
