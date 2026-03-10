@@ -10,6 +10,7 @@
 # =============================================================================
 
 import ifcopenshell
+from collections import defaultdict
 from specklepy.objects.base import Base
 
 
@@ -70,7 +71,6 @@ def _find_connected_components(snapped_faces: list) -> list:
             else:
                 edge_to_face[edge] = fi
 
-    from collections import defaultdict
     groups: dict = defaultdict(list)
     for fi in range(n):
         groups[find(fi)].append(fi)
@@ -384,15 +384,19 @@ def mesh_to_ifc(
     obj_scale = _resolve_scale(obj, scale)
 
     # ------------------------------------------------------------------ #
-    # Pass 1: collect all scaled vertices to compute world origin
+    # Pass 1: unpack vertices once per mesh, collect all scaled coords
+    #         to compute world origin. Cache (verts, ms) for Pass 2.
     # ------------------------------------------------------------------ #
+    mesh_cache = []   # [(verts_list, ms)] or None per mesh
     all_scaled = []
     for mesh in meshes:
         raw_verts = _get(mesh, "vertices") or []
         verts = unwrap_chunks(list(raw_verts))
         if not verts:
+            mesh_cache.append(None)
             continue
         ms = _resolve_scale(mesh, obj_scale)
+        mesh_cache.append((verts, ms))
         for i in range(0, len(verts) - 2, 3):
             all_scaled.extend([
                 float(verts[i])   * ms,
@@ -406,20 +410,19 @@ def mesh_to_ifc(
     ox, oy, oz = compute_origin(all_scaled)
 
     # ------------------------------------------------------------------ #
-    # Pass 2: one brep per mesh (so each can have its own material style)
+    # Pass 2: one brep per mesh — reuse cached verts, only unpack faces
     # ------------------------------------------------------------------ #
     brep_items = []
 
-    for mesh in meshes:
-        raw_verts = _get(mesh, "vertices") or []
+    for mesh, cached in zip(meshes, mesh_cache):
+        if cached is None:
+            continue
+        verts, ms = cached
         raw_faces = _get(mesh, "faces") or []
-        verts     = unwrap_chunks(list(raw_verts))
         faces_raw = unwrap_chunks(list(raw_faces))
 
-        if not verts or not faces_raw:
+        if not faces_raw:
             continue
-
-        ms = _resolve_scale(mesh, obj_scale)
 
         try:
             face_groups = decode_faces(faces_raw)

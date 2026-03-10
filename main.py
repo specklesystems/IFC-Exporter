@@ -178,7 +178,13 @@ def automate_function(
     ifc_filename = f"{file_name}_{timestamp}.ifc"
 
     ifc.write(ifc_filename)
-    automate_context.store_file_result(f"./{ifc_filename}")
+    print(f"\n💾 IFC file written: {ifc_filename}")
+    try:
+        automate_context.mark_run_success("Success! You can download the IFC file below.")
+        automate_context.store_file_result(f"./{ifc_filename}")
+    except Exception as e:
+        print(f"  ⚠️  Could not upload file result (network issue?): {e}")
+        automate_context.mark_run_failed(f"Something went wrong when storing file result. Exception detail: {e}") 
 
     print(f"\n{'=' * 60}")
     print(f"  Export complete!")

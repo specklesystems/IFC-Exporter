@@ -74,9 +74,8 @@ def build_definition_map(root: Base) -> dict:
 
     # Diagnostic: dump first 3 instanceDefinitionProxies to understand structure
     print("\n   [PROXY DIAG] First 3 instanceDefinitionProxies from root:")
-    proxies_raw2 = _get(root, "instanceDefinitionProxies")
-    if proxies_raw2:
-        sample = proxies_raw2 if isinstance(proxies_raw2, list) else [proxies_raw2]
+    if proxies_raw:
+        sample = proxies_raw if isinstance(proxies_raw, list) else [proxies_raw]
         for i, proxy in enumerate(sample[:3]):
             app_id  = _get(proxy, "applicationId") or "?"
             name    = _get(proxy, "name") or "?"
@@ -239,6 +238,10 @@ def _make_ifc_placement(ifc, tx, ty, tz, x_axis, z_axis):
 _stats   = {"found": 0, "not_found": 0}
 _dbg_cnt = [0]
 
+# Cache: mesh id → (verts_flat, faces_raw_flat, ms) to avoid re-unpacking
+# the same definition mesh across many instances that share it.
+_mesh_data_cache: dict = {}
+
 
 _MM_SCALES = {
     "mm": 1.0, "millimeter": 1.0, "millimeters": 1.0,
@@ -313,21 +316,28 @@ def instance_to_ifc(ifc, body_context, obj: Base, definition_map: dict,
     # One brep per mesh so each can have its own material style
     brep_items = []
     for mesh in meshes:
-        raw_verts = _get(mesh, "vertices") or []
-        raw_faces = _get(mesh, "faces") or []
-        verts     = unwrap_chunks(list(raw_verts))
-        faces_raw = unwrap_chunks(list(raw_faces))
-        if not verts or not faces_raw:
-            continue
+        mesh_id = _get(mesh, "id") or _get(mesh, "applicationId")
+        if mesh_id and mesh_id in _mesh_data_cache:
+            verts, face_groups, ms = _mesh_data_cache[mesh_id]
+        else:
+            raw_verts = _get(mesh, "vertices") or []
+            raw_faces = _get(mesh, "faces") or []
+            verts     = unwrap_chunks(list(raw_verts))
+            faces_raw = unwrap_chunks(list(raw_faces))
+            if not verts or not faces_raw:
+                continue
 
-        mesh_units = _get(mesh, "units") or _get(mesh, "_units") or ("m" if ifc_format else "mm")
-        ms = _MM_SCALES.get(mesh_units.lower().strip(), 1.0)
+            mesh_units = _get(mesh, "units") or _get(mesh, "_units") or ("m" if ifc_format else "mm")
+            ms = _MM_SCALES.get(mesh_units.lower().strip(), 1.0)
 
-        try:
-            face_groups = decode_faces(faces_raw)
-        except Exception as e:
-            print(f"  ⚠️  Instance face decode: {e}")
-            continue
+            try:
+                face_groups = decode_faces(faces_raw)
+            except Exception as e:
+                print(f"  ⚠️  Instance face decode: {e}")
+                continue
+
+            if mesh_id:
+                _mesh_data_cache[mesh_id] = (verts, face_groups, ms)
 
         # Pre-compute world coords for all vertices in this mesh
         verts_world = []
