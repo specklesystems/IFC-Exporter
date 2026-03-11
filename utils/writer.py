@@ -74,7 +74,7 @@ def create_ifc_scaffold() -> tuple:
         products=[building],
     )
 
-    return ifc, building, body_ctx
+    return ifc, site, building, body_ctx
 
 
 class StoreyManager:

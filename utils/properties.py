@@ -52,6 +52,7 @@ COMMON_PSET: dict[str, str] = {
     "IfcLightFixture":              "Pset_LightFixtureTypeCommon",
     "IfcOpeningElement":            "Pset_OpeningElementCommon",
     "IfcPlate":                     "Pset_PlateCommon",
+    "IfcGeographicElement":         "Pset_SiteCommon",
 }
 
 # ---------------------------------------------------------------------------
@@ -129,50 +130,124 @@ EXTERNAL_CATEGORIES = {
 # Helpers
 # ---------------------------------------------------------------------------
 
+_props_cache: dict[int, dict] = {}  # id(obj) → props dict
+
+
 def _get_props_dict(obj: Base) -> dict:
-    for key in ["properties", "@properties"]:
-        try:
-            p = obj[key]
-            if p is None:
+    """Get properties as a plain dict. Cached per object to avoid repeated conversion."""
+    oid = id(obj)
+    if oid in _props_cache:
+        return _props_cache[oid]
+    # Try getattr first — matches the pattern that works in other Speckle scripts
+    p = getattr(obj, "properties", None)
+    if p is None:
+        for key in ["properties", "@properties"]:
+            try:
+                p = obj[key]
+                if p is not None:
+                    break
+            except Exception:
                 continue
-            if hasattr(p, "get_dynamic_member_names"):
-                return {n: p[n] for n in p.get_dynamic_member_names()}
-            if isinstance(p, dict):
-                return p
-        except Exception:
-            pass
-    return {}
+    if p is None:
+        _props_cache[oid] = {}
+        return {}
+    result = _to_dict(p)
+    _props_cache[oid] = result
+    return result
 
 
-def _get_nested(d: dict, *keys):
+def _get_nested(d, *keys):
     """Safely walk nested dicts/objects."""
     cur = d
     for k in keys:
         if cur is None:
             return None
-        if isinstance(cur, dict):
-            cur = cur.get(k)
-        else:
-            try:
-                cur = cur[k]
-            except Exception:
-                return None
+        cur = _safe_get(cur, k)
     return cur
 
 
-def _param_value(params_block: dict, internal_name: str):
+_to_dict_cache: dict[int, dict] = {}  # id(obj) → converted dict
+
+
+def _to_dict(obj) -> dict:
+    """Convert a Speckle Base object or dict to a plain dict. Returns {} on failure.
+    Cached per object identity to avoid repeated conversion."""
+    if obj is None:
+        return {}
+    if isinstance(obj, dict):
+        return obj
+    oid = id(obj)
+    if oid in _to_dict_cache:
+        return _to_dict_cache[oid]
+    # Try .get_dynamic_member_names() for Speckle Base objects
+    if hasattr(obj, "get_dynamic_member_names"):
+        result = {}
+        try:
+            names = obj.get_dynamic_member_names()
+        except Exception:
+            _to_dict_cache[oid] = {}
+            return {}
+        for n in names:
+            try:
+                result[n] = obj[n]
+            except Exception:
+                pass
+        _to_dict_cache[oid] = result
+        return result
+    # Last resort: try common dict-like patterns
+    if hasattr(obj, "items"):
+        try:
+            result = dict(obj.items())
+            _to_dict_cache[oid] = result
+            return result
+        except Exception:
+            pass
+    _to_dict_cache[oid] = {}
+    return {}
+
+
+def _safe_get(obj, key, default=None):
+    """Safe key access for both dicts and Speckle Base objects."""
+    if obj is None:
+        return default
+    if isinstance(obj, dict):
+        return obj.get(key, default)
+    # Try getattr first (works reliably for Speckle Base)
+    try:
+        val = getattr(obj, key, None)
+        if val is not None:
+            return val
+    except Exception:
+        pass
+    # Fallback to bracket access
+    try:
+        val = obj[key]
+        if val is not None:
+            return val
+    except Exception:
+        pass
+    return default
+
+
+def _param_value(params_block, internal_name: str):
     """
     Search all groups in a parameter block for a param with the given
     internalDefinitionName. Returns the raw value or None.
+    Handles both plain dicts and Speckle Base objects.
     """
-    if not isinstance(params_block, dict):
+    block = _to_dict(params_block)
+    if not block:
         return None
-    for group in params_block.values():
-        if not isinstance(group, dict):
+    for group in block.values():
+        group_d = _to_dict(group)
+        if not group_d:
             continue
-        for entry in group.values():
-            if isinstance(entry, dict) and entry.get("internalDefinitionName") == internal_name:
-                return entry.get("value")
+        for entry in group_d.values():
+            entry_d = _to_dict(entry)
+            if not entry_d:
+                continue
+            if entry_d.get("internalDefinitionName") == internal_name:
+                return entry_d.get("value")
     return None
 
 
@@ -210,10 +285,8 @@ def build_element_name(obj: Base) -> str:
     Build element name in Revit native IFC format: "Family:TypeName:ElementId"
     Falls back gracefully if any part is missing.
     """
-    props = _get_props_dict(obj)
     family   = getattr(obj, "family", None) or ""
     typ      = getattr(obj, "type", None)   or ""
-    elem_id  = props.get("elementId", "") or getattr(obj, "applicationId", "") or ""
 
     # Treat literal "none" (case-insensitive) the same as empty — Revit exports
     # placeholder objects with family/type set to the string "none".
@@ -223,15 +296,13 @@ def build_element_name(obj: Base) -> str:
         typ = ""
 
     parts = [p for p in [family, typ] if p]
-    if elem_id:
-        parts.append(str(elem_id))
     return ":".join(parts) if parts else (getattr(obj, "id", None) or "unnamed")
 
 
 def get_element_tag(obj: Base) -> str | None:
     """Return Revit ElementId as the IFC Tag."""
     props = _get_props_dict(obj)
-    elem_id = props.get("elementId")
+    elem_id = _safe_get(props, "elementId")
     return str(elem_id) if elem_id else None
 
 
@@ -241,11 +312,12 @@ def get_ifc_guid(obj: Base) -> str | None:
     Falls back to None (ifcopenshell will auto-generate a GUID).
     """
     props = _get_props_dict(obj)
-    params = props.get("Parameters") or {}
-    inst   = params.get("Instance Parameters") or {}
-    ifc_p  = inst.get("IFC Parameters") or {}
-    entry  = ifc_p.get("IfcGUID") or {}
-    val    = entry.get("value") if isinstance(entry, dict) else None
+    params = _safe_get(props, "Parameters", {})
+    inst   = _safe_get(params, "Instance Parameters", {})
+    ifc_p  = _safe_get(inst, "IFC Parameters", {})
+    entry  = _safe_get(ifc_p, "IfcGUID", {})
+    entry_d = _to_dict(entry) if not isinstance(entry, dict) else entry
+    val    = entry_d.get("value") if entry_d else None
     return str(val) if val else None
 
 
@@ -263,9 +335,9 @@ def write_common_pset(ifc, element, obj: Base, ifc_class: str, category_name: st
         return
 
     props = _get_props_dict(obj)
-    params = props.get("Parameters") or {}
-    type_params = params.get("Type Parameters") or {}
-    inst_params = params.get("Instance Parameters") or {}
+    params = _safe_get(props, "Parameters", {})
+    type_params = _safe_get(params, "Type Parameters", {})
+    inst_params = _safe_get(params, "Instance Parameters", {})
 
     ifc_props = []
 
@@ -277,7 +349,7 @@ def write_common_pset(ifc, element, obj: Base, ifc_class: str, category_name: st
             ifc_props.append(p)
 
     # IsExternal — derive from builtInCategory or "Constraints" parameters
-    bic = props.get("builtInCategory", "")
+    bic = _safe_get(props, "builtInCategory", "")
     is_external = bic in EXTERNAL_CATEGORIES
     if not is_external:
         # Some elements expose it directly as a parameter
@@ -384,19 +456,23 @@ def _safe_str(value) -> str | None:
     return s or None
 
 
-def _flatten_params(params_block: dict) -> dict:
-    """Flatten Type or Instance parameter block into {name: display_value}."""
+def _flatten_params(params_block) -> dict:
+    """Flatten Type or Instance parameter block into {name: display_value}.
+    Handles both plain dicts and Speckle Base objects at every nesting level."""
     result = {}
     skip_units = {"", "None", "General", "Currency", "Integer"}
-    for group in params_block.values():
-        if not isinstance(group, dict):
+    block = _to_dict(params_block)
+    for group in block.values():
+        group_d = _to_dict(group)
+        if not group_d:
             continue
-        for entry in group.values():
-            if not isinstance(entry, dict):
+        for entry in group_d.values():
+            entry_d = _to_dict(entry)
+            if not entry_d:
                 continue
-            name  = entry.get("name")
-            value = entry.get("value")
-            units = entry.get("units", "") or ""
+            name  = entry_d.get("name")
+            value = entry_d.get("value")
+            units = entry_d.get("units", "") or ""
             if not name or value is None:
                 continue
             val_str = _safe_str(value)
@@ -409,16 +485,17 @@ def _flatten_params(params_block: dict) -> dict:
 
 def write_revit_params(ifc, element, obj: Base):
     """
-    Write remaining Revit parameters as two custom property sets
+    Write remaining Revit instance parameters as a custom property set
     using the vendor prefix 'RVT_' (not 'Pset_' which is reserved):
-      RVT_TypeParameters     — from Type Parameters
       RVT_InstanceParameters — from Instance Parameters
+
+    Note: RVT_TypeParameters are written on the IfcTypeObject (via TypeManager),
+    not on individual elements, to avoid duplication.
     """
     props = _get_props_dict(obj)
-    params = props.get("Parameters") or {}
+    params = _safe_get(props, "Parameters", {})
 
-    type_flat = _flatten_params(params.get("Type Parameters") or {})
-    inst_flat = _flatten_params(params.get("Instance Parameters") or {})
+    inst_flat = _flatten_params(_safe_get(params, "Instance Parameters", {}))
 
     def build_str_props(flat: dict) -> list:
         out = []
@@ -431,11 +508,8 @@ def write_revit_params(ifc, element, obj: Base):
                 pass
         return out
 
-    type_props = build_str_props(type_flat)
     inst_props = build_str_props(inst_flat)
 
-    if type_props:
-        _write_pset(ifc, element, "RVT_TypeParameters", type_props)
     if inst_props:
         _write_pset(ifc, element, "RVT_InstanceParameters", inst_props)
 
@@ -445,10 +519,10 @@ def write_revit_params(ifc, element, obj: Base):
         val = getattr(obj, field, None)
         if val and isinstance(val, str) and val.strip():
             identity[field.capitalize()] = val.strip()
-    elem_id = props.get("elementId")
+    elem_id = _safe_get(props, "elementId")
     if elem_id:
         identity["ElementId"] = str(elem_id)
-    bic = props.get("builtInCategory")
+    bic = _safe_get(props, "builtInCategory")
     if bic:
         identity["BuiltInCategory"] = str(bic)
 
@@ -468,6 +542,92 @@ def write_revit_params(ifc, element, obj: Base):
 # Public API — called from main.py
 # ---------------------------------------------------------------------------
 
+def write_material_quantities(ifc, element, obj: Base):
+    """
+    Write Material Quantities from Revit as IfcElementQuantity sets.
+
+    Source: properties."Material Quantities".<MaterialName>.{area, volume, density,
+            materialName, materialClass, materialCategory}
+
+    Each material produces one IfcElementQuantity named "Qto_<MaterialName>" with:
+      - GrossArea      (IfcQuantityArea)
+      - GrossVolume    (IfcQuantityVolume)
+      - Density        (IfcPropertySingleValue — no standard IFC quantity type)
+      - MaterialClass  (IfcPropertySingleValue)
+      - MaterialCategory (IfcPropertySingleValue)
+    """
+    props = _get_props_dict(obj)
+    mat_quantities = _safe_get(props, "Material Quantities")
+    if mat_quantities is None:
+        return
+
+    mat_dict = _to_dict(mat_quantities)
+    if not mat_dict:
+        return
+
+    for mat_key, mat_data in mat_dict.items():
+        mat_d = _to_dict(mat_data)
+        if not mat_d:
+            continue
+
+        mat_name = mat_d.get("materialName") or mat_key
+        quantities = []
+
+        # Area → IfcQuantityArea
+        area_entry = _to_dict(mat_d.get("area"))
+        if area_entry and area_entry.get("value") is not None:
+            try:
+                q = ifc.create_entity(
+                    "IfcQuantityArea",
+                    Name="GrossArea",
+                    AreaValue=float(area_entry["value"]),
+                )
+                quantities.append(q)
+            except Exception:
+                pass
+
+        # Volume → IfcQuantityVolume
+        vol_entry = _to_dict(mat_d.get("volume"))
+        if vol_entry and vol_entry.get("value") is not None:
+            try:
+                q = ifc.create_entity(
+                    "IfcQuantityVolume",
+                    Name="GrossVolume",
+                    VolumeValue=float(vol_entry["value"]),
+                )
+                quantities.append(q)
+            except Exception:
+                pass
+
+        # Density → IfcQuantityWeight (mass per volume, stored as weight)
+        density_entry = _to_dict(mat_d.get("density"))
+        if density_entry and density_entry.get("value") is not None:
+            try:
+                q = ifc.create_entity(
+                    "IfcQuantityWeight",
+                    Name="Density",
+                    WeightValue=float(density_entry["value"]),
+                )
+                quantities.append(q)
+            except Exception:
+                pass
+
+        if not quantities:
+            continue
+
+        # Create IfcElementQuantity and link via IfcRelDefinesByProperties
+        qto_name = f"Qto_{mat_name}"
+        try:
+            qto = ifcopenshell.api.run(
+                "pset.add_qto", ifc,
+                product=element,
+                name=qto_name,
+            )
+            qto.Quantities = quantities
+        except Exception as e:
+            print(f"  ⚠️  {qto_name}: {e}")
+
+
 def write_properties(ifc, element, obj: Base, ifc_class: str = "", category_name: str = ""):
     """
     Write all property sets for an IFC element, matching Revit native IFC export structure:
@@ -476,12 +636,19 @@ def write_properties(ifc, element, obj: Base, ifc_class: str = "", category_name
       3. RVT_TypeParameters       — all remaining Revit type parameters
       4. RVT_InstanceParameters   — all remaining Revit instance parameters
       5. RVT_Identity             — family, type, elementId, builtInCategory
+      6. Qto_<MaterialName>       — material quantities (area, volume, density)
     """
     write_common_pset(ifc, element, obj, ifc_class, category_name)
-    write_environmental_pset(ifc, element, obj)
     write_revit_params(ifc, element, obj)
+    write_material_quantities(ifc, element, obj)
 
 
 def write_common_properties(ifc, element, obj: Base, category_name: str = ""):
     """Legacy shim — kept for compatibility with main.py call sites."""
     pass  # All handled by write_properties now
+
+
+def reset_caches():
+    """Clear module-level caches (call at start of each export run)."""
+    _props_cache.clear()
+    _to_dict_cache.clear()

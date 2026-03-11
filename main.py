@@ -6,16 +6,16 @@ import utils.config as config
 
 from utils.materials import MaterialManager
 from utils.traversal import traverse, print_tree
-from utils.mapper import classify
+from utils.mapper import classify, get_predefined_type, reset_caches as reset_mapper_caches
 from utils.geometry import mesh_to_ifc, get_display_instances, _make_placement
-from utils.instances import is_instance, instance_to_ifc, build_definition_map, print_instance_stats
-from utils.properties import write_properties, write_common_properties, build_element_name, get_element_tag, get_ifc_guid
+from utils.instances import is_instance, instance_to_ifc, build_definition_map, print_instance_stats, get_definition_object
+from utils.properties import write_properties, write_common_properties, build_element_name, get_element_tag, get_ifc_guid, reset_caches as reset_props_caches
 from utils.writer import create_ifc_scaffold, StoreyManager
 from utils.type_manager import TypeManager
 
 
 SPATIAL_STRUCTURE_TYPES = {
-    "IfcSite", "IfcBuilding", "IfcBuildingStorey",
+    "IfcBuilding", "IfcBuildingStorey",
     "IfcSpace", "IfcExternalSpatialElement", "IfcSpatialZone",
     "IfcGrid", "IfcAnnotation",
 }
@@ -60,6 +60,10 @@ def automate_function(
     print("  Speckle -> IFC4.3 Exporter")
     print("=" * 60)
 
+    # Reset caches from any previous run
+    reset_props_caches()
+    reset_mapper_caches()
+
     # ------------------------------------------------------------------ #
     # 1. Receive
     # ------------------------------------------------------------------ #
@@ -78,7 +82,7 @@ def automate_function(
     # ------------------------------------------------------------------ #
     # 3. Set up IFC
     # ------------------------------------------------------------------ #
-    ifc, building, body_context = create_ifc_scaffold()
+    ifc, _site, building, body_context = create_ifc_scaffold()
     storey_manager = StoreyManager(ifc, building)
 
     # ------------------------------------------------------------------ #
@@ -113,12 +117,20 @@ def automate_function(
         # Path A: Instance object (has transform + definitionId, no displayValue)
         # ------------------------------------------------------------------ #
         if is_instance(obj):
+            # Instances may lack category info — inherit from definition object
+            if ifc_class == "IfcBuildingElementProxy":
+                def_obj = get_definition_object(obj, definition_map)
+                if def_obj:
+                    ifc_class = classify(def_obj, category_name)
+
             rep, placement = instance_to_ifc(ifc, body_context, obj, definition_map, scale=scale, material_manager=material_manager)
             if not rep:
                 no_geometry += 1
                 continue
             element = _create_element(ifc, ifc_class, name, rep, placement, storey,
-                                         tag=get_element_tag(obj), guid=get_ifc_guid(obj))
+                                         tag=get_element_tag(obj), guid=get_ifc_guid(obj),
+                                         object_type=getattr(obj, "type", None),
+                                         predefined_type=get_predefined_type(obj))
             write_properties(ifc, element, obj, ifc_class=ifc_class, category_name=category_name)
             type_manager.assign(element, obj, ifc_class)
             instance_count += 1
@@ -135,7 +147,9 @@ def automate_function(
             rep, placement = mesh_to_ifc(ifc, body_context, obj, scale=scale, material_manager=material_manager)
             if rep:
                 element = _create_element(ifc, ifc_class, name, rep, placement, storey,
-                                             tag=get_element_tag(obj), guid=get_ifc_guid(obj))
+                                             tag=get_element_tag(obj), guid=get_ifc_guid(obj),
+                                             object_type=getattr(obj, "type", None),
+                                             predefined_type=get_predefined_type(obj))
                 write_properties(ifc, element, obj, ifc_class=ifc_class, category_name=category_name)
                 type_manager.assign(element, obj, ifc_class)
                 total += 1
@@ -152,7 +166,10 @@ def automate_function(
                     no_geometry += 1
                     continue
                 inst_element = _create_element(
-                    ifc, ifc_class, name, inst_rep, inst_placement, storey
+                    ifc, ifc_class, name, inst_rep, inst_placement, storey,
+                    tag=get_element_tag(obj), guid=None,
+                    object_type=getattr(obj, "type", None),
+                    predefined_type=get_predefined_type(obj),
                 )
                 write_properties(ifc, inst_element, obj, ifc_class=ifc_class, category_name=category_name)
                 type_manager.assign(inst_element, obj, ifc_class)
@@ -179,12 +196,12 @@ def automate_function(
 
     ifc.write(ifc_filename)
     print(f"\n💾 IFC file written: {ifc_filename}")
-    try:
-        automate_context.mark_run_success("Success! You can download the IFC file below.")
-        automate_context.store_file_result(f"./{ifc_filename}")
-    except Exception as e:
-        print(f"  ⚠️  Could not upload file result (network issue?): {e}")
-        automate_context.mark_run_failed(f"Something went wrong when storing file result. Exception detail: {e}") 
+    # try:
+    #     automate_context.mark_run_success("Success! You can download the IF file below.")
+    #     automate_context.store_file_result(f"./{ifc_filename}")
+    # except Exception as e:
+    #     print(f"  ⚠️  Could not upload file result (network issue?): {e}")
+    #     automate_context.mark_run_failed(f"Something went wrong when storing file result. Exception detail: {e}") 
 
     print(f"\n{'=' * 60}")
     print(f"  Export complete!")
@@ -197,15 +214,23 @@ def automate_function(
     print_instance_stats()
     print(f"{'=' * 60}\n")
 
-def _create_element(ifc, ifc_class, name, rep, placement, storey, tag=None, guid=None):
+def _create_element(ifc, ifc_class, name, rep, placement, storey,
+                    tag=None, guid=None, object_type=None, predefined_type=None):
     """Helper: create an IFC element, assign geometry + placement + container."""
-    element = ifcopenshell.api.run(
-        "root.create_entity", ifc,
-        ifc_class=ifc_class,
-        name=str(name),
-    )
+    kwargs = {"ifc_class": ifc_class, "name": str(name)}
+    if predefined_type:
+        kwargs["predefined_type"] = predefined_type
+    element = ifcopenshell.api.run("root.create_entity", ifc, **kwargs)
     if tag:
-        element.Tag = str(tag)
+        try:
+            element.Tag = str(tag)
+        except AttributeError:
+            pass
+    if object_type:
+        try:
+            element.ObjectType = str(object_type)
+        except AttributeError:
+            pass
     if guid:
         try:
             element.GlobalId = guid
@@ -221,11 +246,20 @@ def _create_element(ifc, ifc_class, name, rep, placement, storey, tag=None, guid
     else:
         element.ObjectPlacement = _make_placement(ifc, 0.0, 0.0, 0.0)
 
-    ifcopenshell.api.run(
-        "spatial.assign_container", ifc,
-        relating_structure=storey,
-        products=[element],
-    )
+    # IfcSite is a spatial structure element — can't use spatial.assign_container.
+    # Use aggregate.assign_object to nest it under the storey instead.
+    if ifc_class == "IfcSite":
+        ifcopenshell.api.run(
+            "aggregate.assign_object", ifc,
+            relating_object=storey,
+            products=[element],
+        )
+    else:
+        ifcopenshell.api.run(
+            "spatial.assign_container", ifc,
+            relating_structure=storey,
+            products=[element],
+        )
     return element
 
 # make sure to call the function with the executor

@@ -136,7 +136,7 @@ class MaterialManager:
         return style
 
     def apply_to_item(self, item, mesh_app_id: str):
-        """Assign the material style to a single IFC geometry item (e.g. IfcFacetedBrep)."""
+        """Assign the material style to a single IFC geometry item (e.g. IfcPolygonalFaceSet)."""
         style = self.get_style(mesh_app_id)
         if style is None:
             return

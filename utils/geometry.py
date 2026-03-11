@@ -1,16 +1,17 @@
 # =============================================================================
 # geometry.py
-# Converts Speckle DataObject geometry → IFC IfcFacetedBrep + IfcLocalPlacement
+# Converts Speckle DataObject geometry → IFC IfcPolygonalFaceSet + IfcLocalPlacement
 #
 # Key facts:
 #   - After specklepy receive(), vertices and faces are FLAT Python lists
 #   - displayValue is an array of Mesh objects
 #   - Units are in mm (for Revit), scale to metres for IFC
 #   - Vertices are in absolute world coordinates
+#   - Uses IfcPolygonalFaceSet (indexed vertices) instead of IfcFacetedBrep
+#     for compact output — each vertex stored once, not once per face.
 # =============================================================================
 
 import ifcopenshell
-from collections import defaultdict
 from specklepy.objects.base import Base
 
 
@@ -25,7 +26,7 @@ _UNIT_SCALES = {
 
 
 # --------------------------------------------------------------------------- #
-# Geometry validation helpers (GEM111 + BRP002 fixes)
+# Geometry validation helpers (GEM111 fix)
 # --------------------------------------------------------------------------- #
 
 # Minimum distance in mm below which two vertices are considered identical (GEM111).
@@ -37,126 +38,75 @@ def snap_coord(v: float) -> int:
     return round(v / _VERTEX_MERGE_TOL)
 
 
-def _find_connected_components(snapped_faces: list) -> list:
+def build_ifc_facesets(ifc, verts_scaled: list, face_groups: list) -> list:
     """
-    Union-Find: group face indices into connected components.
-    Two faces are connected if they share an edge (pair of snapped vertex keys).
-    Returns list of components, each a list of face indices.
+    Build a list of IfcPolygonalFaceSet from scaled (x,y,z) vertices and face index groups.
 
-    BRP002 requires all faces in an IfcClosedShell to form ONE component.
-    If multiple components exist, each must become a separate IfcClosedShell.
-    """
-    n = len(snapped_faces)
-    if n == 0:
-        return []
-
-    parent = list(range(n))
-
-    def find(x):
-        while parent[x] != x:
-            parent[x] = parent[parent[x]]
-            x = parent[x]
-        return x
-
-    def union(a, b):
-        parent[find(a)] = find(b)
-
-    # Map each edge to the first face that used it, then union subsequent faces
-    edge_to_face = {}
-    for fi, keys in enumerate(snapped_faces):
-        for i in range(len(keys)):
-            edge = frozenset([keys[i], keys[(i + 1) % len(keys)]])
-            if edge in edge_to_face:
-                union(fi, edge_to_face[edge])
-            else:
-                edge_to_face[edge] = fi
-
-    groups: dict = defaultdict(list)
-    for fi in range(n):
-        groups[find(fi)].append(fi)
-    return list(groups.values())
-
-
-def build_ifc_breps(ifc, verts_scaled: list, face_groups: list) -> list:
-    """
-    Build a list of IfcFacetedBrep from scaled (x,y,z) vertices and face index groups.
+    Uses IfcCartesianPointList3D + IfcIndexedPolygonalFace for compact output.
+    Vertices are deduplicated via snap grid so each unique position is stored once.
 
     GEM111 fix: skip faces with near-duplicate vertices (snapped to same grid cell).
-    BRP002 fix: split faces into connected components; each component → its own
-                IfcClosedShell → IfcFacetedBrep so every shell is arc-wise connected.
 
     verts_scaled: flat list of already-scaled floats [x0,y0,z0, x1,y1,z1, ...]
     face_groups:  list of index lists [[i,j,k], [i,j,k,l], ...]
-    Returns: list of IfcFacetedBrep (one per connected component, never empty).
+    Returns: list of IfcPolygonalFaceSet (typically one, empty on failure).
     """
-    # Pass 1: validate faces and build snapped key lists for connectivity analysis
-    valid_faces = []    # list of (pts_raw, snapped_keys)
+    # Build deduplicated vertex list via snap grid
+    snap_to_idx = {}   # snap_key → 0-based index in deduped_verts
+    deduped_verts = [] # [(x, y, z), ...]
+
+    def get_vertex_index(x, y, z):
+        key = (snap_coord(x), snap_coord(y), snap_coord(z))
+        if key in snap_to_idx:
+            return snap_to_idx[key], key
+        idx = len(deduped_verts)
+        snap_to_idx[key] = idx
+        deduped_verts.append((x, y, z))
+        return idx, key
+
+    # Validate faces and remap indices to deduplicated vertex list
+    valid_faces = []  # list of [idx0, idx1, idx2, ...] (0-based into deduped_verts)
     for indices in face_groups:
         try:
-            pts_raw = []
-            snapped = []
+            remapped = []
+            seen_snaps = set()
             degenerate = False
-            seen = set()
 
             for i in indices:
                 x = float(verts_scaled[i * 3])
                 y = float(verts_scaled[i * 3 + 1])
                 z = float(verts_scaled[i * 3 + 2])
-                key = (snap_coord(x), snap_coord(y), snap_coord(z))
-                if key in seen:
+                idx, snap_key = get_vertex_index(x, y, z)
+                if snap_key in seen_snaps:
                     degenerate = True
                     break
-                seen.add(key)
-                pts_raw.append((x, y, z))
-                snapped.append(key)
+                seen_snaps.add(snap_key)
+                remapped.append(idx)
 
-            if degenerate or len(pts_raw) < 3:
+            if degenerate or len(remapped) < 3:
                 continue
-
-            valid_faces.append((pts_raw, snapped))
+            valid_faces.append(remapped)
         except Exception:
             continue
 
-    if not valid_faces:
+    if not valid_faces or not deduped_verts:
         return []
 
-    # Pass 2: split into connected components (BRP002)
-    snapped_only = [f[1] for f in valid_faces]
-    components = _find_connected_components(snapped_only)
-
-    # Pass 3: build one IfcFacetedBrep per component
-    breps = []
-    for component_indices in components:
+    # Build IFC entities
+    try:
+        point_list = ifc.createIfcCartesianPointList3D(
+            [list(v) for v in deduped_verts]
+        )
         ifc_faces = []
-        for fi in component_indices:
-            pts_raw, _ = valid_faces[fi]
-            try:
-                pts = [ifc.createIfcCartesianPoint([x, y, z]) for x, y, z in pts_raw]
-                poly  = ifc.createIfcPolyLoop(pts)
-                bound = ifc.createIfcFaceOuterBound(poly, True)
-                ifc_faces.append(ifc.createIfcFace([bound]))
-            except Exception:
-                continue
+        for face_indices in valid_faces:
+            # IfcIndexedPolygonalFace uses 1-based indices
+            coord_index = [idx + 1 for idx in face_indices]
+            ifc_faces.append(ifc.createIfcIndexedPolygonalFace(coord_index))
 
-        if not ifc_faces:
-            continue
-
-        shell = ifc.createIfcClosedShell(ifc_faces)
-        breps.append(ifc.createIfcFacetedBrep(shell))
-
-    return breps
-
-
-# Keep old name as alias so instances.py import works unchanged
-def build_ifc_faces(ifc, verts_scaled: list, face_groups: list) -> list:
-    """Legacy wrapper — returns flat list of IfcFace (no connectivity splitting)."""
-    # Used only as a fallback; callers should prefer build_ifc_breps directly.
-    breps = build_ifc_breps(ifc, verts_scaled, face_groups)
-    # Return the faces from all shells combined (for callers that need face lists)
-    faces = []
-    for brep in breps:
-        faces.extend(brep.Outer.CfsFaces)
-    return faces
+        faceset = ifc.createIfcPolygonalFaceSet(point_list, None, ifc_faces, None)
+        return [faceset]
+    except Exception:
+        return []
 
 
 # --------------------------------------------------------------------------- #
@@ -189,31 +139,32 @@ def unwrap_chunks(raw) -> list:
 
     Handles two cases:
       1. Already flat list of numbers (after specklepy receive deserializes)
-         → [3, 0, 1, 2, 3, ...] returned as-is
+         → returned as-is (fast path)
       2. List of DataChunk objects (raw from server before deserialization)
          → each chunk's .data list is concatenated
-
-    Both cases are handled so this function is always safe to call.
     """
     if not raw:
         return []
 
+    # Fast path: if first item is a number, assume all items are numbers
+    first = raw[0]
+    if isinstance(first, (int, float)):
+        return raw
+
+    # Slow path: DataChunk objects or mixed content
     result = []
     for item in raw:
         if item is None:
             continue
-        # Plain number — already flat
         if isinstance(item, (int, float)):
             result.append(item)
             continue
-        # DataChunk — unwrap .data
         speckle_type = getattr(item, "speckle_type", "") or ""
         if "DataChunk" in speckle_type:
             chunk_data = _get(item, "data") or _get(item, "@data")
             if chunk_data:
                 result.extend(list(chunk_data))
         else:
-            # Unknown — try iterating (handles nested lists)
             try:
                 result.extend(list(item))
             except Exception:
@@ -318,17 +269,18 @@ def decode_faces(faces_raw: list) -> list:
     """
     decoded = []
     i = 0
-    while i < len(faces_raw):
+    total = len(faces_raw)
+    while i < total:
         n = int(faces_raw[i])
         if n == 0:
             n = 3
         elif n == 1:
             n = 4
         end = i + 1 + n
-        if end > len(faces_raw):
+        if end > total:
             break
-        indices = [int(faces_raw[i + 1 + j]) for j in range(n)]
-        decoded.append(indices)
+        # Direct slice is faster than list comprehension with int()
+        decoded.append([int(v) for v in faces_raw[i + 1:end]])
         i = end
     return decoded
 
@@ -374,7 +326,7 @@ def mesh_to_ifc(
 ) -> tuple:
     """
     Convert a Speckle DataObject → (IfcShapeRepresentation, IfcLocalPlacement).
-    Creates one IfcFacetedBrep per mesh so each can carry its own material style.
+    Creates one IfcPolygonalFaceSet per mesh so each can carry its own material style.
     Returns (None, None) if no usable geometry is found.
     """
     meshes = get_display_meshes(obj)
@@ -387,7 +339,7 @@ def mesh_to_ifc(
     # Pass 1: unpack vertices once per mesh, collect all scaled coords
     #         to compute world origin. Cache (verts, ms) for Pass 2.
     # ------------------------------------------------------------------ #
-    mesh_cache = []   # [(verts_list, ms)] or None per mesh
+    mesh_cache = []   # [(verts_list, ms, scaled)] or None per mesh
     all_scaled = []
     for mesh in meshes:
         raw_verts = _get(mesh, "vertices") or []
@@ -396,13 +348,10 @@ def mesh_to_ifc(
             mesh_cache.append(None)
             continue
         ms = _resolve_scale(mesh, obj_scale)
-        mesh_cache.append((verts, ms))
-        for i in range(0, len(verts) - 2, 3):
-            all_scaled.extend([
-                float(verts[i])   * ms,
-                float(verts[i+1]) * ms,
-                float(verts[i+2]) * ms,
-            ])
+        # Pre-scale vertices once, reuse in Pass 2
+        scaled = [float(v) * ms for v in verts]
+        mesh_cache.append((verts, ms, scaled))
+        all_scaled.extend(scaled)
 
     if not all_scaled:
         return None, None
@@ -410,14 +359,14 @@ def mesh_to_ifc(
     ox, oy, oz = compute_origin(all_scaled)
 
     # ------------------------------------------------------------------ #
-    # Pass 2: one brep per mesh — reuse cached verts, only unpack faces
+    # Pass 2: one faceset per mesh — reuse cached verts, only unpack faces
     # ------------------------------------------------------------------ #
-    brep_items = []
+    geom_items = []
 
     for mesh, cached in zip(meshes, mesh_cache):
         if cached is None:
             continue
-        verts, ms = cached
+        verts, ms, scaled = cached
         raw_faces = _get(mesh, "faces") or []
         faces_raw = unwrap_chunks(list(raw_faces))
 
@@ -430,28 +379,29 @@ def mesh_to_ifc(
             print(f"  ⚠️  Face decode error: {e}")
             continue
 
-        # Build pre-scaled vertex list (relative to origin) for this mesh
-        verts_scaled = []
-        for vi in range(0, len(verts) - 2, 3):
-            verts_scaled.append(float(verts[vi])   * ms - ox)
-            verts_scaled.append(float(verts[vi+1]) * ms - oy)
-            verts_scaled.append(float(verts[vi+2]) * ms - oz)
+        # Offset pre-scaled vertices relative to origin
+        n = len(scaled)
+        verts_scaled = [0.0] * n
+        for vi in range(0, n - 2, 3):
+            verts_scaled[vi]     = scaled[vi]     - ox
+            verts_scaled[vi + 1] = scaled[vi + 1] - oy
+            verts_scaled[vi + 2] = scaled[vi + 2] - oz
 
-        mesh_breps = build_ifc_breps(ifc, verts_scaled, face_groups)
+        mesh_facesets = build_ifc_facesets(ifc, verts_scaled, face_groups)
 
-        if not mesh_breps:
+        if not mesh_facesets:
             continue
 
-        # Apply material style to every component brep of this mesh
+        # Apply material style to every faceset of this mesh
         if material_manager:
             mesh_app_id = _get(mesh, "applicationId")
             if mesh_app_id:
-                for brep in mesh_breps:
-                    material_manager.apply_to_item(brep, str(mesh_app_id))
+                for fs in mesh_facesets:
+                    material_manager.apply_to_item(fs, str(mesh_app_id))
 
-        brep_items.extend(mesh_breps)
+        geom_items.extend(mesh_facesets)
 
-    if not brep_items:
+    if not geom_items:
         return None, None
 
     # ------------------------------------------------------------------ #
@@ -460,8 +410,8 @@ def mesh_to_ifc(
     rep = ifc.createIfcShapeRepresentation(
         ContextOfItems=body_context,
         RepresentationIdentifier="Body",
-        RepresentationType="Brep",
-        Items=brep_items,
+        RepresentationType="Tessellation",
+        Items=geom_items,
     )
     placement = _make_placement(ifc, ox, oy, oz)
 

@@ -22,6 +22,7 @@ import ifcopenshell.api
 from specklepy.objects.base import Base
 from utils.properties import (
     _get_props_dict, _get_nested, _param_value, _make_prop, _write_pset,
+    _safe_get, _to_dict,
     COMMON_PSET, EXTERNAL_CATEGORIES, _flatten_params
 )
 
@@ -112,9 +113,9 @@ class TypeManager:
                      obj: Base, ifc_class: str):
         """Instantiate the IfcTypeObject with name, tag, GlobalId, and psets."""
         props       = _get_props_dict(obj)
-        params      = props.get("Parameters") or {}
-        type_params = params.get("Type Parameters") or {}
-        inst_params = params.get("Instance Parameters") or {}
+        params      = _safe_get(props, "Parameters", {})
+        type_params = _safe_get(params, "Type Parameters", {})
+        inst_params = _safe_get(params, "Instance Parameters", {})
 
         # Name: "Family:TypeName" (no ElementId)
         name_parts = [p for p in [family, type_name] if p]
@@ -122,13 +123,13 @@ class TypeManager:
 
         # Tag: Type's Revit ElementId
         type_id_entry = _get_nested(inst_params, "Other", "Type Id")
-        tag = str(type_id_entry.get("value")) if isinstance(type_id_entry, dict) else None
+        type_id_d = _to_dict(type_id_entry)
+        tag = str(type_id_d.get("value")) if type_id_d.get("value") else None
 
         # GlobalId: from Type IfcGUID parameter
         type_guid_entry = _get_nested(type_params, "IFC Parameters", "Type IfcGUID")
-        guid = None
-        if isinstance(type_guid_entry, dict):
-            guid = type_guid_entry.get("value")
+        type_guid_d = _to_dict(type_guid_entry)
+        guid = type_guid_d.get("value") if type_guid_d else None
 
         # Create type entity
         type_obj = ifcopenshell.api.run(
@@ -163,7 +164,7 @@ class TypeManager:
             type_ifc_props = []
 
             # IsExternal (type-level)
-            bic = props.get("builtInCategory", "")
+            bic = _safe_get(props, "builtInCategory", "")
             is_external = bic in EXTERNAL_CATEGORIES
             if ifc_class not in {"IfcSpace", "IfcSite", "IfcBuildingStorey",
                                   "IfcBuilding", "IfcFurnishingElement", "IfcOpeningElement"}:
@@ -196,12 +197,6 @@ class TypeManager:
 
             if type_ifc_props:
                 _write_pset(ifc, type_obj, pset_name, type_ifc_props)
-
-        # ── Pset_EnvironmentalImpactIndicators on the type ─────────────────
-        if type_name:
-            p = _make_prop(ifc, "Reference", "IfcIdentifier", type_name)
-            if p:
-                _write_pset(ifc, type_obj, "Pset_EnvironmentalImpactIndicators", [p])
 
         # ── RVT_TypeParameters — all type-level Revit params ──────────────
         type_flat = _flatten_params(type_params)

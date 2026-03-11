@@ -15,10 +15,14 @@
 #   Definition geometry lives in root → Collection("definitionGeometry")
 #
 # We detect the format by the definitionId prefix.
+#
+# Performance: uses IfcRepresentationMap + IfcMappedItem so that all instances
+# sharing the same definition reference a single copy of the geometry.
 # =============================================================================
 
+import math
 from specklepy.objects.base import Base
-from utils.geometry import _get, unwrap_chunks, decode_faces, _UNIT_SCALES, build_ifc_breps
+from utils.geometry import _get, unwrap_chunks, decode_faces, _UNIT_SCALES, build_ifc_facesets
 
 
 def is_instance(obj) -> bool:
@@ -212,35 +216,17 @@ def _resolve_instance_scale(obj, stream_scale: float) -> float:
     return stream_scale
 
 
-def _parse_transform(t: list, scale: float) -> tuple:
-    """
-    Row-major 4x4 matrix.
-    Translation at t[3], t[7], t[11] — scaled to metres.
-    Local X axis = row 0, Local Z axis = row 2.
-    """
-    tx = float(t[3])  * scale
-    ty = float(t[7])  * scale
-    tz = float(t[11]) * scale
-    x_axis = (float(t[0]), float(t[1]), float(t[2]))
-    z_axis = (float(t[8]), float(t[9]), float(t[10]))
-    return (tx, ty, tz), x_axis, z_axis
-
-
-def _make_ifc_placement(ifc, tx, ty, tz, x_axis, z_axis):
-    origin = ifc.createIfcCartesianPoint([tx, ty, tz])
-    x_dir  = ifc.createIfcDirection(list(x_axis))
-    z_dir  = ifc.createIfcDirection(list(z_axis))
-    a2p    = ifc.createIfcAxis2Placement3D(origin, z_dir, x_dir)
-    return ifc.createIfcLocalPlacement(PlacementRelTo=None, RelativePlacement=a2p)
-
-
 # Stats
 _stats   = {"found": 0, "not_found": 0}
 _dbg_cnt = [0]
 
-# Cache: mesh id → (verts_flat, faces_raw_flat, ms) to avoid re-unpacking
+# Cache: mesh id → (verts_flat, face_groups, ms) to avoid re-unpacking
 # the same definition mesh across many instances that share it.
 _mesh_data_cache: dict = {}
+
+# Cache: definition_id → IfcRepresentationMap (or None if no geometry)
+# All instances sharing the same definition reuse one geometry copy.
+_rep_map_cache: dict = {}
 
 
 _MM_SCALES = {
@@ -251,70 +237,19 @@ _MM_SCALES = {
 }
 
 
-def _apply_transform(t: list, vx: float, vy: float, vz: float, ts: float) -> tuple:
+# --------------------------------------------------------------------------- #
+# IfcRepresentationMap builder — geometry created once per definition
+# --------------------------------------------------------------------------- #
+
+def _build_rep_map(ifc, body_context, meshes: list, ifc_format: bool,
+                   material_manager=None):
     """
-    Apply a row-major 4x4 transform to a single vertex.
-    ts = scale factor applied to the translation components only (not rotation).
-    For Revit mm data with IFC in mm: ts=1.0 (no conversion).
-    For IFC-format transforms (metres): ts=1000.0 (m→mm).
-    Rotation components are dimensionless and never scaled.
+    Build an IfcRepresentationMap from definition meshes.
+    Geometry is in local coordinates (mm, no instance transform applied).
+    Returns IfcRepresentationMap or None if no valid geometry.
     """
-    x = t[0]*vx + t[1]*vy + t[2]*vz  + t[3]  * ts
-    y = t[4]*vx + t[5]*vy + t[6]*vz  + t[7]  * ts
-    z = t[8]*vx + t[9]*vy + t[10]*vz + t[11] * ts
-    return x, y, z
+    geom_items = []
 
-
-def instance_to_ifc(ifc, body_context, obj: Base, definition_map: dict,
-                    scale: float = 1.0, material_manager=None):
-    """
-    Convert a Speckle InstanceProxy → (IfcShapeRepresentation, IfcLocalPlacement).
-
-    Strategy: BAKE the full 4x4 transform into every vertex (world coordinates).
-    Creates one IfcFacetedBrep per definition mesh so each can carry its own
-    material style via renderMaterialProxies.
-    """
-    transform_raw = _get(obj, "transform")
-    if not transform_raw:
-        return None, None
-    t = list(transform_raw)
-    if len(t) != 16:
-        return None, None
-
-    definition_id = _get(obj, "definitionId") or ""
-    ifc_format    = _is_ifc_format(definition_id)
-
-    # Translation scale: IFC format transform is in metres → convert to mm
-    # Revit format transform is already in mm (same as IFC file units)
-    ts = 1000.0 if ifc_format else _resolve_instance_scale(obj, scale)
-
-    if _dbg_cnt[0] < 6:
-        _dbg_cnt[0] += 1
-        fmt = "IFC" if ifc_format else "Revit"
-        x_axis = (round(t[0],2), round(t[1],2), round(t[2],2))
-        z_axis = (round(t[8],2), round(t[9],2), round(t[10],2))
-        print(f"  [INST {_dbg_cnt[0]} {fmt}] {definition_id[:40]}")
-        print(f"    t[3]={t[3]:.1f} t[7]={t[7]:.1f} t[11]={t[11]:.1f}  x={x_axis}  z={z_axis}")
-
-    # World-origin placement (geometry is baked to world coords)
-    origin    = ifc.createIfcCartesianPoint([0.0, 0.0, 0.0])
-    a2p       = ifc.createIfcAxis2Placement3D(origin, None, None)
-    placement = ifc.createIfcLocalPlacement(PlacementRelTo=None, RelativePlacement=a2p)
-
-    # Get definition meshes
-    if ifc_format:
-        meshes = _get_ifc_meshes(definition_id, definition_map)
-    else:
-        meshes = _get_revit_meshes(definition_id, definition_map)
-
-    if not meshes:
-        _stats["not_found"] += 1
-        return None, placement
-
-    _stats["found"] += 1
-
-    # One brep per mesh so each can have its own material style
-    brep_items = []
     for mesh in meshes:
         mesh_id = _get(mesh, "id") or _get(mesh, "applicationId")
         if mesh_id and mesh_id in _mesh_data_cache:
@@ -339,41 +274,216 @@ def instance_to_ifc(ifc, body_context, obj: Base, definition_map: dict,
             if mesh_id:
                 _mesh_data_cache[mesh_id] = (verts, face_groups, ms)
 
-        # Pre-compute world coords for all vertices in this mesh
-        verts_world = []
+        # Scale vertices to mm (local coordinates, no instance transform)
+        verts_local = []
         for vi in range(0, len(verts) - 2, 3):
-            lx = float(verts[vi])   * ms
-            ly = float(verts[vi+1]) * ms
-            lz = float(verts[vi+2]) * ms
-            wx, wy, wz = _apply_transform(t, lx, ly, lz, ts)
-            verts_world.append(wx)
-            verts_world.append(wy)
-            verts_world.append(wz)
+            verts_local.append(float(verts[vi])   * ms)
+            verts_local.append(float(verts[vi+1]) * ms)
+            verts_local.append(float(verts[vi+2]) * ms)
 
-        mesh_breps = build_ifc_breps(ifc, verts_world, face_groups)
+        mesh_facesets = build_ifc_facesets(ifc, verts_local, face_groups)
 
-        if not mesh_breps:
+        if not mesh_facesets:
             continue
 
-        # Apply material style to every component brep of this mesh
+        # Apply material style to each faceset
         if material_manager:
             mesh_app_id = _get(mesh, "applicationId")
             if mesh_app_id:
-                for brep in mesh_breps:
-                    material_manager.apply_to_item(brep, str(mesh_app_id))
+                for fs in mesh_facesets:
+                    material_manager.apply_to_item(fs, str(mesh_app_id))
 
-        brep_items.extend(mesh_breps)
+        geom_items.extend(mesh_facesets)
 
-    if not brep_items:
+    if not geom_items:
+        return None
+
+    # Mapping origin = identity (local coords origin)
+    origin = ifc.createIfcCartesianPoint([0.0, 0.0, 0.0])
+    a2p    = ifc.createIfcAxis2Placement3D(origin, None, None)
+
+    # The mapped representation holds the actual geometry
+    mapped_rep = ifc.createIfcShapeRepresentation(
+        ContextOfItems=body_context,
+        RepresentationIdentifier="Body",
+        RepresentationType="Tessellation",
+        Items=geom_items,
+    )
+
+    return ifc.createIfcRepresentationMap(a2p, mapped_rep)
+
+
+# --------------------------------------------------------------------------- #
+# Transform → IfcCartesianTransformationOperator3D
+# --------------------------------------------------------------------------- #
+
+def _vec_magnitude(x, y, z):
+    return math.sqrt(x*x + y*y + z*z)
+
+
+def _make_transform_operator(ifc, t: list, ts: float):
+    """
+    Convert a row-major 4x4 matrix + translation scale into an
+    IfcCartesianTransformationOperator3DnonUniform.
+
+    t:  16 floats, row-major [r00,r01,r02,tx, r10,r11,r12,ty, r20,r21,r22,tz, 0,0,0,1]
+    ts: scale factor for translation components (e.g. 1000.0 for m→mm)
+
+    The matrix acts as: p' = M * p + translation, where M rows are:
+      row0 = (t[0], t[1], t[2])
+      row1 = (t[4], t[5], t[6])
+      row2 = (t[8], t[9], t[10])
+
+    IfcCartesianTransformationOperator axes represent the COLUMNS of M:
+      Axis1 = column 0 = where local X maps → (t[0], t[4], t[8])
+      Axis2 = column 1 = where local Y maps → (t[1], t[5], t[9])
+      Axis3 = column 2 = where local Z maps → (t[2], t[6], t[10])
+
+    Returns the IFC entity, or None if the transform is degenerate.
+    """
+    # Extract COLUMNS of the 3x3 rotation/scale sub-matrix
+    ax1 = (float(t[0]), float(t[4]), float(t[8]))    # column 0: X-axis direction
+    ax2 = (float(t[1]), float(t[5]), float(t[9]))    # column 1: Y-axis direction
+    ax3 = (float(t[2]), float(t[6]), float(t[10]))   # column 2: Z-axis direction
+
+    s1 = _vec_magnitude(*ax1)
+    s2 = _vec_magnitude(*ax2)
+    s3 = _vec_magnitude(*ax3)
+
+    if s1 < 1e-10 or s2 < 1e-10 or s3 < 1e-10:
+        return None  # degenerate transform
+
+    # Normalized direction vectors
+    d1 = ifc.createIfcDirection([ax1[0]/s1, ax1[1]/s1, ax1[2]/s1])
+    d2 = ifc.createIfcDirection([ax2[0]/s2, ax2[1]/s2, ax2[2]/s2])
+    d3 = ifc.createIfcDirection([ax3[0]/s3, ax3[1]/s3, ax3[2]/s3])
+
+    # Translation, scaled to mm
+    tx = float(t[3])  * ts
+    ty = float(t[7])  * ts
+    tz = float(t[11]) * ts
+    origin = ifc.createIfcCartesianPoint([tx, ty, tz])
+
+    # Use non-uniform variant to handle mirrors and non-uniform scale
+    return ifc.createIfcCartesianTransformationOperator3DnonUniform(
+        d1,      # Axis1
+        d2,      # Axis2
+        origin,  # LocalOrigin
+        s1,      # Scale
+        d3,      # Axis3
+        s2,      # Scale2
+        s3,      # Scale3
+    )
+
+
+# --------------------------------------------------------------------------- #
+# Main conversion — IfcMappedItem approach
+# --------------------------------------------------------------------------- #
+
+def instance_to_ifc(ifc, body_context, obj: Base, definition_map: dict,
+                    scale: float = 1.0, material_manager=None):
+    """
+    Convert a Speckle InstanceProxy → (IfcShapeRepresentation, IfcLocalPlacement).
+
+    Strategy: create geometry once per definition as an IfcRepresentationMap,
+    then reference it via IfcMappedItem + IfcCartesianTransformationOperator3D
+    for each instance. This avoids duplicating geometry across instances.
+    """
+    transform_raw = _get(obj, "transform")
+    if not transform_raw:
+        return None, None
+    t = list(transform_raw)
+    if len(t) != 16:
+        return None, None
+
+    definition_id = _get(obj, "definitionId") or ""
+    ifc_format    = _is_ifc_format(definition_id)
+
+    # Translation scale: IFC format transform is in metres → convert to mm
+    # Revit format transform is already in mm (same as IFC file units)
+    ts = 1000.0 if ifc_format else _resolve_instance_scale(obj, scale)
+
+    if _dbg_cnt[0] < 6:
+        _dbg_cnt[0] += 1
+        fmt = "IFC" if ifc_format else "Revit"
+        x_axis = (round(t[0],2), round(t[1],2), round(t[2],2))
+        z_axis = (round(t[8],2), round(t[9],2), round(t[10],2))
+        print(f"  [INST {_dbg_cnt[0]} {fmt}] {definition_id[:40]}")
+        print(f"    t[3]={t[3]:.1f} t[7]={t[7]:.1f} t[11]={t[11]:.1f}  x={x_axis}  z={z_axis}")
+
+    # Identity placement (transform is encoded in the MappedItem)
+    origin    = ifc.createIfcCartesianPoint([0.0, 0.0, 0.0])
+    a2p       = ifc.createIfcAxis2Placement3D(origin, None, None)
+    placement = ifc.createIfcLocalPlacement(PlacementRelTo=None, RelativePlacement=a2p)
+
+    # --- Get or build IfcRepresentationMap (cached per definition_id) ---
+    if definition_id not in _rep_map_cache:
+        if ifc_format:
+            meshes = _get_ifc_meshes(definition_id, definition_map)
+        else:
+            meshes = _get_revit_meshes(definition_id, definition_map)
+
+        if not meshes:
+            _stats["not_found"] += 1
+            _rep_map_cache[definition_id] = None
+            return None, placement
+
+        _stats["found"] += 1
+        _rep_map_cache[definition_id] = _build_rep_map(
+            ifc, body_context, meshes, ifc_format, material_manager
+        )
+    else:
+        # Track stats even for cached definitions
+        if _rep_map_cache[definition_id] is not None:
+            _stats["found"] += 1
+        else:
+            _stats["not_found"] += 1
+
+    rep_map = _rep_map_cache[definition_id]
+    if rep_map is None:
         return None, placement
+
+    # --- Build transform operator from instance's 4x4 matrix ---
+    transform_op = _make_transform_operator(ifc, t, ts)
+    if transform_op is None:
+        return None, placement
+
+    # --- Create IfcMappedItem referencing the shared geometry ---
+    mapped_item = ifc.createIfcMappedItem(rep_map, transform_op)
 
     rep = ifc.createIfcShapeRepresentation(
         ContextOfItems=body_context,
         RepresentationIdentifier="Body",
-        RepresentationType="Brep",
-        Items=brep_items,
+        RepresentationType="MappedRepresentation",
+        Items=[mapped_item],
     )
     return rep, placement
+
+
+def get_definition_object(obj: Base, definition_map: dict):
+    """
+    Resolve the definition's source object for an InstanceProxy.
+    Returns the first object referenced by the definition proxy, which
+    carries the proper category/type info. Returns None if not found.
+    """
+    definition_id = _get(obj, "definitionId") or ""
+    if not definition_id:
+        return None
+
+    ifc_proxies = definition_map.get("ifc_proxies", {})
+    proxy = ifc_proxies.get(definition_id) or ifc_proxies.get(definition_id.lower())
+    if proxy is None:
+        return None
+
+    object_ids = _get(proxy, "objects") or []
+    if not isinstance(object_ids, list):
+        object_ids = list(object_ids)
+    if not object_ids:
+        return None
+
+    by_app_id = definition_map.get("by_app_id", {})
+    source = by_app_id.get(str(object_ids[0]).lower())
+    return source
 
 
 def print_instance_stats():
@@ -381,3 +491,12 @@ def print_instance_stats():
     print(f"  Instance resolution: {_stats['found']}/{total} definitions found")
     if _stats["not_found"] > 0:
         print(f"  ⚠️  {_stats['not_found']} instances had no definition geometry")
+
+
+def reset_caches():
+    """Reset module-level caches (call at start of each export run)."""
+    _mesh_data_cache.clear()
+    _rep_map_cache.clear()
+    _stats["found"] = 0
+    _stats["not_found"] = 0
+    _dbg_cnt[0] = 0

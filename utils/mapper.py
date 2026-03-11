@@ -36,6 +36,7 @@ BUILTIN_CATEGORY_MAP: dict[str, str] = {
     # Architectural - Stairs / Ramps / Railings
     "OST_Stairs":                           "IfcStair",
     "OST_StairsRailing":                    "IfcRailing",
+    "OST_RailingTopRail":                   "IfcRailing",
     "OST_Ramps":                            "IfcRamp",
     "OST_StairsLandings":                   "IfcStairFlight",
     "OST_StairsRuns":                       "IfcStairFlight",
@@ -101,6 +102,7 @@ BUILTIN_CATEGORY_MAP: dict[str, str] = {
     # Site / Civil
     "OST_Site":                             "IfcSite",
     "OST_Topography":                       "IfcGeographicElement",
+    "OST_Toposolid":                        "IfcGeographicElement",
     "OST_Roads":                            "IfcRoad",
     "OST_Hardscape":                        "IfcPavement",
     "OST_Planting":                         "IfcGeographicElement",
@@ -114,6 +116,12 @@ BUILTIN_CATEGORY_MAP: dict[str, str] = {
     "OST_Grids":                            "IfcGrid",
     "OST_Levels":                           "IfcBuildingStorey",
     "OST_Views":                            "IfcAnnotation",
+}
+
+
+# --- OST_ BuiltInCategory → PredefinedType (where applicable) ---
+BUILTIN_PREDEFINED_TYPE: dict[str, str] = {
+    "OST_RailingTopRail":                   "HANDRAIL",
 }
 
 
@@ -173,6 +181,7 @@ CATEGORY_MAP: dict[str, str] = {
     "Stairs":                       "IfcStair",
     "Ramps":                        "IfcRamp",
     "Railings":                     "IfcRailing",
+    "Top Rails":                    "IfcRailing",
     "Curtain Panels":               "IfcCurtainWall",
     "Curtain Wall Mullions":        "IfcMember",
     "Doors":                        "IfcDoor",
@@ -188,6 +197,8 @@ CATEGORY_MAP: dict[str, str] = {
     "Structural Foundations":       "IfcFooting",
     "Foundation Slabs":             "IfcSlab",
     "Topography":                   "IfcGeographicElement",
+    "Toposolid":                    "IfcGeographicElement",
+    "Planting":                     "IfcGeographicElement",
     "Site":                         "IfcSite",
     "Parking":                      "IfcSpace",
     "Generic Models":               "IfcBuildingElementProxy",
@@ -196,24 +207,55 @@ CATEGORY_MAP: dict[str, str] = {
 }
 
 
+def get_predefined_type(obj) -> str | None:
+    """Return the IFC PredefinedType for an object based on its builtInCategory, or None."""
+    bic = _get_builtin_category(obj)
+    if bic and bic in BUILTIN_PREDEFINED_TYPE:
+        return BUILTIN_PREDEFINED_TYPE[bic]
+    return None
+
+
+_bic_cache: dict[int, str | None] = {}  # id(obj) → builtInCategory
+
+
 def _get_builtin_category(obj) -> str | None:
     """
     Read builtInCategory from obj.properties.builtInCategory.
-    Returns the OST_ string or None.
+    Returns the OST_ string or None. Cached per object.
     """
+    oid = id(obj)
+    if oid in _bic_cache:
+        return _bic_cache[oid]
+    result = None
     try:
-        props = obj["properties"] or getattr(obj, "properties", None)
+        props = getattr(obj, "properties", None)
         if props is None:
-            return None
-        if hasattr(props, "__getitem__"):
-            val = props["builtInCategory"]
-        else:
+            try:
+                props = obj["properties"]
+            except Exception:
+                pass
+        if props is not None:
             val = getattr(props, "builtInCategory", None)
-        if val and isinstance(val, str):
-            return val.strip()
+            if val is None:
+                try:
+                    val = props["builtInCategory"]
+                except Exception:
+                    pass
+            if val and isinstance(val, str):
+                result = val.strip()
     except Exception:
         pass
-    return None
+    _bic_cache[oid] = result
+    return result
+
+
+# Pre-computed lowercase category map for substring matching
+_CATEGORY_MAP_LOWER: list[tuple[str, str]] = [
+    (k.lower(), v) for k, v in CATEGORY_MAP.items()
+]
+
+# Classification cache: (obj_id, category_name) → ifc_class
+_classify_cache: dict[tuple, str] = {}
 
 
 def classify(obj, category_name: str = "") -> str:
@@ -227,6 +269,16 @@ def classify(obj, category_name: str = "") -> str:
       4. obj.category field
       5. IfcBuildingElementProxy fallback
     """
+    cache_key = (id(obj), category_name)
+    if cache_key in _classify_cache:
+        return _classify_cache[cache_key]
+
+    result = _classify_impl(obj, category_name)
+    _classify_cache[cache_key] = result
+    return result
+
+
+def _classify_impl(obj, category_name: str) -> str:
     # 1. builtInCategory — most reliable, direct Revit enum
     bic = _get_builtin_category(obj)
     if bic and bic in BUILTIN_CATEGORY_MAP:
@@ -244,8 +296,9 @@ def classify(obj, category_name: str = "") -> str:
     if category_name:
         if category_name in CATEGORY_MAP:
             return CATEGORY_MAP[category_name]
-        for key, ifc_class in CATEGORY_MAP.items():
-            if key.lower() in category_name.lower():
+        cat_lower = category_name.lower()
+        for key_lower, ifc_class in _CATEGORY_MAP_LOWER:
+            if key_lower in cat_lower:
                 return ifc_class
 
     # 4. obj.category field
@@ -253,8 +306,15 @@ def classify(obj, category_name: str = "") -> str:
     if obj_category and isinstance(obj_category, str):
         if obj_category in CATEGORY_MAP:
             return CATEGORY_MAP[obj_category]
-        for key, ifc_class in CATEGORY_MAP.items():
-            if key.lower() in obj_category.lower():
+        obj_cat_lower = obj_category.lower()
+        for key_lower, ifc_class in _CATEGORY_MAP_LOWER:
+            if key_lower in obj_cat_lower:
                 return ifc_class
 
     return "IfcBuildingElementProxy"
+
+
+def reset_caches():
+    """Clear module-level caches (call at start of each export run)."""
+    _bic_cache.clear()
+    _classify_cache.clear()
