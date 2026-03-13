@@ -150,41 +150,6 @@ The exporter writes property sets matching Revit's native IFC export structure:
 | `RVT_Identity` | Family, Type, ElementId, BuiltInCategory |
 | `Qto_<MaterialName>` | Material quantities: area, volume, density |
 
-## Getting Started
-
-### Prerequisites
-
-- Python 3.11+
-- A Speckle account and project with a Revit model
-
-### Setup
-
-```bash
-python -m venv .venv
-# Windows
-.venv\Scripts\activate
-# macOS/Linux
-source .venv/bin/activate
-
-pip install --upgrade pip
-pip install .[dev]
-```
-
-### Running Locally
-
-Configure your Speckle Automate credentials, then:
-
-```bash
-python main.py
-```
-
-### Deploying to Speckle Automate
-
-1. [Create](https://automate.speckle.dev/) a new Speckle Automation
-2. Select your Speckle Project and Model
-3. Select this function
-4. Configure the inputs (file name, project/site/building names)
-5. Click Create Automation
 
 ## Function Inputs
 
@@ -194,6 +159,15 @@ python main.py
 | `IFC_PROJECT_NAME` | Name for the IfcProject entity |
 | `IFC_SITE_NAME` | Name for the IfcSite entity |
 | `IFC_BUILDING_NAME` | Name for the IfcBuilding entity |
+
+## Testing
+
+| Model Name                      | Revit Size | IFC Size | Conversion Time |
+|----------------------------------|------------|----------|-----------------|
+| Huge confidential model         | 450 MB     | 391 MB   | 2h 30m          |
+| Snowdon Towers (Architecture)   | 93.2 MB    | 118 MB   | 8m 37s          |
+| Speckle Tower                   | 51 MB      | 45 MB    | 3m              |
+| Rac Basic Sample Model          | 18.8 MB    | 12 MB    | 12s             |
 
 ## Resources
 
