@@ -424,7 +424,102 @@ def write_common_pset(ifc, element, obj: Base, ifc_class: str, category_name: st
             except Exception:
                 pass
 
+    # IfcSpace-specific: set Name, LongName, Category, and BaseQuantities
+    if ifc_class == "IfcSpace":
+        _write_space_properties(ifc, element, obj, ifc_props)
+
     _write_pset(ifc, element, pset_name, ifc_props)
+
+
+def _write_space_properties(ifc, element, obj: Base, ifc_props: list):
+    """
+    Set IfcSpace attributes and BaseQuantities from Revit Room parameters.
+
+    Uses internalDefinitionName to find values:
+      ROOM_NUMBER  → IfcSpace.Name + Pset_SpaceCommon.Reference
+      ROOM_NAME    → IfcSpace.LongName
+      Occupant     → Pset_SpaceCommon.Category
+      ROOM_AREA    → Qto_SpaceBaseQuantities.NetFloorArea
+      ROOM_VOLUME  → Qto_SpaceBaseQuantities.NetVolume
+    """
+    props = _get_props_dict(obj)
+    params = _safe_get(props, "Parameters", {})
+    inst_params = _safe_get(params, "Instance Parameters", {})
+
+    # --- Room Number → IfcSpace.Name + Pset_SpaceCommon.Reference ---
+    room_number = _param_value(inst_params, "ROOM_NUMBER")
+    if room_number:
+        room_number = str(room_number).strip()
+        element.Name = room_number
+        # Replace any existing Reference in ifc_props
+        ifc_props[:] = [p for p in ifc_props if p.Name != "Reference"]
+        p = _make_prop(ifc, "Reference", "IfcIdentifier", room_number)
+        if p:
+            ifc_props.append(p)
+        # Also add as explicit RoomNumber in the pset
+        p = _make_prop(ifc, "RoomNumber", "IfcLabel", room_number)
+        if p:
+            ifc_props.append(p)
+
+    # --- Room Name → IfcSpace.LongName + Pset_SpaceCommon.RoomName ---
+    room_name = _param_value(inst_params, "ROOM_NAME")
+    if not room_name:
+        # Fallback to the Speckle object's own name
+        room_name = getattr(obj, "name", None)
+    if room_name:
+        room_name = str(room_name).strip()
+        try:
+            element.LongName = room_name
+        except AttributeError:
+            pass
+        p = _make_prop(ifc, "RoomName", "IfcLabel", room_name)
+        if p:
+            ifc_props.append(p)
+
+    # --- Occupant → Pset_SpaceCommon.Category ---
+    occupant = _param_value(inst_params, "Occupant")
+    if occupant:
+        p = _make_prop(ifc, "Category", "IfcLabel", str(occupant).strip())
+        if p:
+            ifc_props.append(p)
+
+    # --- Area & Volume → Qto_SpaceBaseQuantities ---
+    quantities = []
+
+    area_val = _param_value(inst_params, "ROOM_AREA")
+    if area_val is not None:
+        try:
+            q = ifc.create_entity(
+                "IfcQuantityArea",
+                Name="NetFloorArea",
+                AreaValue=float(area_val),
+            )
+            quantities.append(q)
+        except Exception:
+            pass
+
+    volume_val = _param_value(inst_params, "ROOM_VOLUME")
+    if volume_val is not None:
+        try:
+            q = ifc.create_entity(
+                "IfcQuantityVolume",
+                Name="NetVolume",
+                VolumeValue=float(volume_val),
+            )
+            quantities.append(q)
+        except Exception:
+            pass
+
+    if quantities:
+        try:
+            qto = ifcopenshell.api.run(
+                "pset.add_qto", ifc,
+                product=element,
+                name="Qto_SpaceBaseQuantities",
+            )
+            qto.Quantities = quantities
+        except Exception as e:
+            print(f"  ⚠️  Qto_SpaceBaseQuantities: {e}")
 
 
 # ---------------------------------------------------------------------------

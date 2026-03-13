@@ -14,7 +14,7 @@ from utils.type_manager import TypeManager
 
 SPATIAL_STRUCTURE_TYPES = {
     "IfcBuilding", "IfcBuildingStorey",
-    "IfcSpace", "IfcExternalSpatialElement", "IfcSpatialZone",
+    "IfcExternalSpatialElement", "IfcSpatialZone",
     "IfcGrid", "IfcAnnotation",
 }
 
@@ -110,7 +110,12 @@ def automate_function(
             skipped_spatial += 1
             continue
 
-        name   = build_element_name(obj)
+        # IfcSpace uses the Speckle object name (e.g. "Rooms - Live/Work Unit 507")
+        # instead of Family:Type (which is "none:none" for Revit rooms)
+        if ifc_class == "IfcSpace":
+            name = getattr(obj, "name", None) or build_element_name(obj)
+        else:
+            name = build_element_name(obj)
         storey = storey_manager.get_or_create(level_name)
 
         # ------------------------------------------------------------------ #
@@ -250,8 +255,10 @@ def _create_element(ifc, ifc_class, name, rep, placement, storey,
         element.ObjectPlacement = _make_placement(ifc, 0.0, 0.0, 0.0)
 
     # Queue spatial assignment (batched flush at end for performance)
+    # IfcSpace is a spatial structure element — must be decomposed (aggregated)
+    # under its IfcBuildingStorey, not spatially contained.
     if storey_manager:
-        if ifc_class == "IfcSite":
+        if ifc_class in ("IfcSite", "IfcSpace"):
             storey_manager.queue_aggregate(storey, element)
         else:
             storey_manager.queue_contain(storey, element)
