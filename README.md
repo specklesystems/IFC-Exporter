@@ -1,174 +1,203 @@
-# Speckle Automate function template - Python
+# Speckle to IFC 4.3 Exporter
 
-This template repository is for a Speckle Automate function written in Python
-using the [specklepy](https://pypi.org/project/specklepy/) SDK to interact with Speckle data.
+A [Speckle Automate](https://automate.speckle.dev/) function that converts Speckle BIM models (primarily from Revit) into IFC 4.3 files using [ifcopenshell](https://ifcopenshell.org/).
 
-This template contains the full scaffolding required to publish a function to the Automate environment.
-It also has some sane defaults for development environment setups.
+## What It Does
 
-## Getting started
+The exporter receives a Speckle model version, walks its object tree, and produces a standards-compliant IFC 4.3 file. Each Speckle object becomes an IFC element with:
 
-1. Use this template repository to create a new repository in your own / organization's profile.
-1. Register the function
+- Correct IFC entity classification (IfcWall, IfcSlab, IfcColumn, etc.)
+- Tessellated geometry (IfcPolygonalFaceSet)
+- Material colours from Speckle render materials
+- Revit property sets (Common psets, instance/type parameters, material quantities)
+- IFC type objects (IfcWallType, IfcSlabType, etc.) shared across instances
+- Spatial structure (IfcProject > IfcSite > IfcBuilding > IfcBuildingStorey)
 
-### Add new dependencies
+## Pipeline Overview
 
-To add new Python package dependencies to the project, edit the `pyproject.toml` file:
-
-**For packages your function needs to run** (like pandas, requests, etc.):
-```toml
-dependencies = [
-    "specklepy==3.0.0",
-    "pandas==2.1.0",  # Add production dependencies here
-]
+```
+Speckle Model
+    │
+    ▼
+1. Receive version (specklepy)
+    │
+    ▼
+2. Build definition map (for instance geometry reuse)
+    │
+    ▼
+3. Create IFC scaffold (Project → Site → Building)
+    │
+    ▼
+4. Traverse object tree
+    │   For each leaf element:
+    │   ├── Classify → IFC entity class
+    │   ├── Convert geometry → IfcPolygonalFaceSet
+    │   ├── Create IFC element + placement
+    │   ├── Write property sets
+    │   └── Assign IFC type object
+    │
+    ▼
+5. Flush spatial containment & type relationships
+    │
+    ▼
+6. Write .ifc file
 ```
 
-**For development tools** (like testing or formatting tools):
-```toml
-[project.optional-dependencies]
-dev = [
-    "black==23.12.1",
-    "pytest-mock==3.11.1",  # Add development dependencies here
-    # ... other dev tools
-]
-```
+## Module Structure
 
-**How to decide which section?**
-- If your `main.py` (or other function logic) imports it → `dependencies`
-- If it's just a tool to help you code → `[project.optional-dependencies].dev`
+| File | Purpose |
+|------|---------|
+| `main.py` | Entry point, orchestrates the full pipeline |
+| `utils/traversal.py` | Walks the Speckle Collection tree (Project > Level > Category > Element) |
+| `utils/mapper.py` | Classifies Speckle objects into IFC entity types |
+| `utils/geometry.py` | Converts Speckle meshes to IfcPolygonalFaceSet geometry |
+| `utils/instances.py` | Handles InstanceProxy objects with shared geometry (IfcMappedItem) |
+| `utils/properties.py` | Writes IFC property sets from Revit parameters |
+| `utils/type_manager.py` | Creates and caches IfcTypeObjects (IfcWallType, etc.) |
+| `utils/materials.py` | Maps Speckle render materials to IfcSurfaceStyle colours |
+| `utils/writer.py` | Creates the IFC file scaffold and manages storey creation |
+| `utils/config.py` | Project/site/building name configuration |
 
-Example:
-```python
-# In your main.py
-import pandas as pd  # ← This goes in dependencies
-import specklepy     # ← This goes in dependencies
+## Mapping Logic
 
-# You won't import these in main.py:
-# pytest, black, mypy ← These go in [project.optional-dependencies].dev
-```
+Classification of Speckle objects to IFC entity types follows a priority chain with three lookup tables. The first match wins.
 
-### Change launch variables
+### Priority 1: `builtInCategory` (OST_ enum)
 
-Describe how the launch.json should be edited.
+The most reliable source. Read from `obj.properties.builtInCategory`, which contains the Revit `BuiltInCategory` enum value. This is a direct Revit classification and maps unambiguously to IFC.
 
-### GitHub Codespaces
+Examples:
+| builtInCategory | IFC Class |
+|---|---|
+| `OST_Walls` | `IfcWall` |
+| `OST_Floors` | `IfcSlab` |
+| `OST_StructuralColumns` | `IfcColumn` |
+| `OST_StructuralFraming` | `IfcBeam` |
+| `OST_Doors` | `IfcDoor` |
+| `OST_Windows` | `IfcWindow` |
+| `OST_Roofs` | `IfcRoof` |
+| `OST_CurtainWallPanels` | `IfcCurtainWall` |
+| `OST_DuctCurves` | `IfcDuctSegment` |
+| `OST_PipeCurves` | `IfcPipeSegment` |
+| `OST_LightingFixtures` | `IfcLightFixture` |
+| `OST_Furniture` | `IfcFurnishingElement` |
 
-Create a new repo from this template, and use the create new code.
+The full table covers ~70 Revit categories across Architectural, Structural, MEP (HVAC, Plumbing, Electrical), and Site/Civil disciplines.
 
-### Using this Speckle Function
+### Priority 2: `speckle_type` prefix
 
-1. [Create](https://automate.speckle.dev/) a new Speckle Automation.
-1. Select your Speckle Project and Speckle Model.
-1. Select the deployed Speckle Function.
-1. Enter a phrase to use in the comment.
-1. Click `Create Automation`.
+For typed Speckle objects, the `speckle_type` string is matched. Exact match is tried first, then longest-prefix match.
 
-## Getting Started with Creating Your Own Speckle Function
+Examples:
+| speckle_type | IFC Class |
+|---|---|
+| `Objects.BuiltElements.Wall` | `IfcWall` |
+| `Objects.BuiltElements.Floor` | `IfcSlab` |
+| `Objects.BuiltElements.Revit.RevitWall` | `IfcWall` |
+| `Objects.BuiltElements.Revit.RevitColumn` | `IfcColumn` |
+| `Objects.Geometry.Mesh` | `IfcBuildingElementProxy` |
 
-1. [Register](https://automate.speckle.dev/) your Function with [Speckle Automate](https://automate.speckle.dev/) and select the Python template.
-1. A new repository will be created in your GitHub account.
-1. Make changes to your Function in `main.py`. See below for the Developer Requirements and instructions on how to test.
-1. To create a new version of your Function, create a new [GitHub release](https://docs.github.com/en/repositories/releasing-projects-on-github/managing-releases-in-a-repository) in your repository.
+### Priority 3: Category name (display string)
 
-## Developer Requirements
+The category name from the traversal context (the name of the parent Collection in the Speckle tree). Exact match first, then case-insensitive substring match.
 
-1. Install the following:
-    - [Python 3.11+](https://www.python.org/downloads/)
-1. Run the following to set up your development environment:
-    ```bash
-    python -m venv .venv
-    # On Windows
-    .venv\Scripts\activate
-    # On macOS/Linux
-    source .venv/bin/activate
+Examples:
+| Category Name | IFC Class |
+|---|---|
+| `Walls` | `IfcWall` |
+| `Structural Columns` | `IfcColumn` |
+| `Plumbing Fixtures` | `IfcSanitaryTerminal` |
+| `Lighting Fixtures` | `IfcLightFixture` |
 
-    pip install --upgrade pip
-    pip install .[dev]
-    ```
+### Priority 4: `obj.category` field
 
-**What this installs:**
-- All the packages your function needs to run (`dependencies`)
-- Plus development tools like testing and code formatting (`[project.optional-dependencies].dev`)
+Same lookup as Priority 3, but using the object's own `category` attribute.
 
-**Why separate sections?**
-- `dependencies`: Only what gets deployed with your function (lightweight)
-- `dev` dependencies: Extra tools to help you write better code locally
+### Fallback
 
-## Building and Testing
+If none of the above match, the object is classified as `IfcBuildingElementProxy`.
 
-The code can be tested locally by running `pytest`.
+## Geometry Handling
 
-### Alternative dependency managers
+### Direct Meshes (Path B1)
 
-This template uses the modern **PEP 621** standard in `pyproject.toml`, which works with all modern Python dependency managers:
+Objects with `displayValue` containing Mesh objects are converted directly:
 
-#### Using Poetry
+1. Extract vertices and faces from each mesh in `displayValue`
+2. Scale vertices to millimetres based on the mesh's unit declaration
+3. Deduplicate vertices via snap grid (0.01mm tolerance) to avoid IFC GEM111 errors
+4. Build `IfcPolygonalFaceSet` with `IfcCartesianPointList3D` + `IfcIndexedPolygonalFace`
+5. Compute bounding box origin for `IfcLocalPlacement`, offset vertices relative to it
+
+### Instance Objects (Path A / B2)
+
+Speckle `InstanceProxy` objects reference shared definition geometry via `definitionId`. The exporter supports two formats:
+
+- **Revit format**: `definitionId` is a 64-char hex hash; geometry is found by walking the object tree
+- **IFC format**: `definitionId` starts with `DEFINITION:`; geometry is in `definitionGeometry` collection
+
+Performance optimisation: geometry is built once as an `IfcRepresentationMap`, then each instance references it via `IfcMappedItem` + `IfcCartesianTransformationOperator3DnonUniform`. This avoids duplicating vertex data across hundreds of identical elements (e.g. chairs, light fixtures, curtain wall panels).
+
+## Property Sets
+
+The exporter writes property sets matching Revit's native IFC export structure:
+
+| Property Set | Content |
+|---|---|
+| `Pset_<Entity>Common` | Standard IFC properties: Reference, IsExternal, LoadBearing, ThermalTransmittance |
+| `RVT_TypeParameters` | All Revit type parameters (written on the IfcTypeObject) |
+| `RVT_InstanceParameters` | All Revit instance parameters |
+| `RVT_Identity` | Family, Type, ElementId, BuiltInCategory |
+| `Qto_<MaterialName>` | Material quantities: area, volume, density |
+
+## Getting Started
+
+### Prerequisites
+
+- Python 3.11+
+- A Speckle account and project with a Revit model
+
+### Setup
+
 ```bash
-poetry install  # Automatically reads pyproject.toml
+python -m venv .venv
+# Windows
+.venv\Scripts\activate
+# macOS/Linux
+source .venv/bin/activate
+
+pip install --upgrade pip
+pip install .[dev]
 ```
 
-#### Using uv
+### Running Locally
+
+Configure your Speckle Automate credentials, then:
+
 ```bash
-uv sync  # Automatically reads pyproject.toml
+python main.py
 ```
 
-#### Using pip-tools
-```bash
-pip-compile pyproject.toml  # Generate requirements.txt from pyproject.toml
-pip install -r requirements.txt
-```
+### Deploying to Speckle Automate
 
-#### Using pdm
-```bash
-pdm install  # Automatically reads pyproject.toml
-```
+1. [Create](https://automate.speckle.dev/) a new Speckle Automation
+2. Select your Speckle Project and Model
+3. Select this function
+4. Configure the inputs (file name, project/site/building names)
+5. Click Create Automation
 
-**Advantage**: All tools read the same `pyproject.toml` file, so there's no need to keep multiple files in sync!
+## Function Inputs
 
-### Building and running the Docker Container Image
-
-Running and testing your code on your machine is a great way to develop your Function; the following instructions are a bit more in-depth and only required if you are having issues with your Function in GitHub Actions or on Speckle Automate.
-
-#### Building the Docker Container Image
-
-The GitHub Action packages your code into the format required by Speckle Automate. This is done by building a Docker Image, which Speckle Automate runs. You can attempt to build the Docker Image locally to test the building process.
-
-To build the Docker Container Image, you must have [Docker](https://docs.docker.com/get-docker/) installed.
-
-Once you have Docker running on your local machine:
-
-1. Open a terminal
-1. Navigate to the directory in which you cloned this repository
-1. Run the following command:
-
-    ```bash
-    docker build -f ./Dockerfile -t speckle_automate_python_example .
-    ```
-
-#### Running the Docker Container Image
-
-Once the GitHub Action has built the image, it is sent to Speckle Automate. When Speckle Automate runs your Function as part of an Automation, it will run the Docker Container Image. You can test that your Docker Container Image runs correctly locally.
-
-1. To then run the Docker Container Image, run the following command:
-
-    ```bash
-    docker run --rm speckle_automate_python_example \
-    python -u main.py run \
-    '{"projectId": "1234", "modelId": "1234", "branchName": "myBranch", "versionId": "1234", "speckleServerUrl": "https://speckle.xyz", "automationId": "1234", "automationRevisionId": "1234", "automationRunId": "1234", "functionId": "1234", "functionName": "my function", "functionLogo": "base64EncodedPng"}' \
-    '{}' \
-    yourSpeckleServerAuthenticationToken
-    ```
-
-Let's explain this in more detail:
-
-`docker run—-rm speckle_automate_python_example` tells Docker to run the Docker Container Image we built earlier. `speckle_automate_python_example` is the name of the Docker Container Image. The `--rm` flag tells Docker to remove the container after it has finished running, freeing up space on your machine.
-
-The line `python -u main.py run` is the command run inside the Docker Container Image. The rest of the command is the arguments passed to the command. The arguments are:
-
-- `'{"projectId": "1234", "modelId": "1234", "branchName": "myBranch", "versionId": "1234", "speckleServerUrl": "https://speckle.xyz", "automationId": "1234", "automationRevisionId": "1234", "automationRunId": "1234", "functionId": "1234", "functionName": "my function", "functionLogo": "base64EncodedPng"}'` - the metadata that describes the automation and the function.
-- `{}` - the input parameters for the function the Automation creator can set. Here, they are blank, but you can add your parameters to test your function.
-- `yourSpeckleServerAuthenticationToken`—the authentication token for the Speckle Server that the Automation can connect to. This is required to interact with the Speckle Server, for example, to get data from the Model.
+| Input | Description |
+|---|---|
+| `file_name` | Output IFC filename (timestamp is appended automatically) |
+| `IFC_PROJECT_NAME` | Name for the IfcProject entity |
+| `IFC_SITE_NAME` | Name for the IfcSite entity |
+| `IFC_BUILDING_NAME` | Name for the IfcBuilding entity |
 
 ## Resources
 
-- [Learn](https://speckle.guide/dev/python.html) more about SpecklePy and interacting with Speckle from Python.
+- [Speckle Developer Docs](https://speckle.guide/dev/python.html)
+- [ifcopenshell Documentation](https://ifcopenshell.org/)
+- [IFC 4.3 Schema](https://standards.buildingsmart.org/IFC/RELEASE/IFC4x3/HTML/)
+- [Revit BuiltInCategory Reference](https://www.revitapidocs.com/2019/ba1c5b30-242f-5fdc-8ea9-ec3b61e6e722.htm)

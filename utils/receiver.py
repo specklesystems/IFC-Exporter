@@ -3,29 +3,36 @@
 # Connects to Speckle and receives the root Base object for a given version.
 # =============================================================================
 
+import os
+from dotenv import load_dotenv
 from specklepy.api.client import SpeckleClient
 from specklepy.api.credentials import get_default_account
 from specklepy.api import operations
 from specklepy.transports.server import ServerTransport
-import utils.config as config
+
+load_dotenv()
+
+SPECKLE_HOST = os.getenv("SPECKLE_SERVER_URL", "https://app.speckle.systems")
+SPECKLE_TOKEN = os.getenv("SPECKLE_TOKEN", "")
+DEFAULT_UNITS = "mm"
 
 
 def get_client() -> SpeckleClient:
     """
     Create and authenticate a SpeckleClient.
-    Uses a personal access token from config.py.
+    Uses a personal access token from the .env file.
     To use your local Speckle Manager account instead, swap to get_default_account().
     """
-    client = SpeckleClient(host=config.SPECKLE_HOST)
+    client = SpeckleClient(host=SPECKLE_HOST)
 
-    if config.SPECKLE_TOKEN and config.SPECKLE_TOKEN != "YOUR_PERSONAL_ACCESS_TOKEN":
-        client.authenticate_with_token(config.SPECKLE_TOKEN)
+    if SPECKLE_TOKEN and SPECKLE_TOKEN != "YOUR_PERSONAL_ACCESS_TOKEN":
+        client.authenticate_with_token(SPECKLE_TOKEN)
     else:
         # Fallback: use account from Speckle Manager desktop app
         account = get_default_account()
         if account is None:
             raise RuntimeError(
-                "No Speckle account found. Either set SPECKLE_TOKEN in config.py "
+                "No Speckle account found. Either set SPECKLE_TOKEN in .env "
                 "or log in via Speckle Manager."
             )
         client.authenticate_with_account(account)
@@ -46,11 +53,11 @@ def receive_version(project_id: str, version_id: str):
     """
     client = get_client()
 
-    print(f"🔗 Connecting to {config.SPECKLE_HOST}...")
+    print(f"🔗 Connecting to {SPECKLE_HOST}...")
     print(f"📦 Receiving project={project_id}  version={version_id}")
 
     # Get version metadata to find the referenced object ID
-    version = client.version.get(version_id,project_id)
+    version = client.version.get(version_id, project_id)
     referenced_object_id = version.referenced_object
 
     # Download the full object graph
@@ -58,7 +65,7 @@ def receive_version(project_id: str, version_id: str):
     base = operations.receive(referenced_object_id, transport)
 
     # Read units from the root object
-    units = getattr(base, "units", config.DEFAULT_UNITS) or config.DEFAULT_UNITS
+    units = getattr(base, "units", DEFAULT_UNITS) or DEFAULT_UNITS
 
     # IFC file is declared in MILLIMETRES — no conversion needed.
     # All geometry stays in source units (mm). scale=1.0 means "keep as-is".

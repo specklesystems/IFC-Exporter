@@ -119,12 +119,6 @@ BUILTIN_CATEGORY_MAP: dict[str, str] = {
 }
 
 
-# --- OST_ BuiltInCategory → PredefinedType (where applicable) ---
-BUILTIN_PREDEFINED_TYPE: dict[str, str] = {
-    "OST_RailingTopRail":                   "HANDRAIL",
-}
-
-
 # --- speckle_type → IFC class (secondary lookup) ---
 SPECKLE_TYPE_MAP: dict[str, str] = {
     "Objects.BuiltElements.Wall":                        "IfcWall",
@@ -207,14 +201,6 @@ CATEGORY_MAP: dict[str, str] = {
 }
 
 
-def get_predefined_type(obj) -> str | None:
-    """Return the IFC PredefinedType for an object based on its builtInCategory, or None."""
-    bic = _get_builtin_category(obj)
-    if bic and bic in BUILTIN_PREDEFINED_TYPE:
-        return BUILTIN_PREDEFINED_TYPE[bic]
-    return None
-
-
 _bic_cache: dict[int, str | None] = {}  # id(obj) → builtInCategory
 
 
@@ -248,6 +234,11 @@ def _get_builtin_category(obj) -> str | None:
     _bic_cache[oid] = result
     return result
 
+
+# Pre-computed: sorted prefixes longest-first for early exit on prefix match
+_SPECKLE_PREFIXES: list[tuple[str, str]] = sorted(
+    SPECKLE_TYPE_MAP.items(), key=lambda x: len(x[0]), reverse=True
+)
 
 # Pre-computed lowercase category map for substring matching
 _CATEGORY_MAP_LOWER: list[tuple[str, str]] = [
@@ -284,15 +275,16 @@ def _classify_impl(obj, category_name: str) -> str:
     if bic and bic in BUILTIN_CATEGORY_MAP:
         return BUILTIN_CATEGORY_MAP[bic]
 
-    # 2. speckle_type
+    # 2. speckle_type — exact match first, then longest-prefix match
     speckle_type = getattr(obj, "speckle_type", "") or ""
-    if speckle_type in SPECKLE_TYPE_MAP:
-        return SPECKLE_TYPE_MAP[speckle_type]
-    for key, ifc_class in SPECKLE_TYPE_MAP.items():
-        if speckle_type.startswith(key):
-            return ifc_class
+    if speckle_type:
+        if speckle_type in SPECKLE_TYPE_MAP:
+            return SPECKLE_TYPE_MAP[speckle_type]
+        for prefix, ifc_class in _SPECKLE_PREFIXES:
+            if speckle_type.startswith(prefix):
+                return ifc_class
 
-    # 3. category_name from traversal context
+    # 3. category_name from traversal context — exact match first
     if category_name:
         if category_name in CATEGORY_MAP:
             return CATEGORY_MAP[category_name]

@@ -31,11 +31,7 @@ _UNIT_SCALES = {
 
 # Minimum distance in mm below which two vertices are considered identical (GEM111).
 _VERTEX_MERGE_TOL = 0.01  # 0.01 mm
-
-
-def snap_coord(v: float) -> int:
-    """Snap a coordinate to integer grid at _VERTEX_MERGE_TOL resolution."""
-    return round(v / _VERTEX_MERGE_TOL)
+_INV_TOL = 1.0 / _VERTEX_MERGE_TOL  # pre-computed: multiply instead of divide
 
 
 def build_ifc_facesets(ifc, verts_scaled: list, face_groups: list) -> list:
@@ -51,21 +47,12 @@ def build_ifc_facesets(ifc, verts_scaled: list, face_groups: list) -> list:
     face_groups:  list of index lists [[i,j,k], [i,j,k,l], ...]
     Returns: list of IfcPolygonalFaceSet (typically one, empty on failure).
     """
-    # Build deduplicated vertex list via snap grid
     snap_to_idx = {}   # snap_key → 0-based index in deduped_verts
-    deduped_verts = [] # [(x, y, z), ...]
-
-    def get_vertex_index(x, y, z):
-        key = (snap_coord(x), snap_coord(y), snap_coord(z))
-        if key in snap_to_idx:
-            return snap_to_idx[key], key
-        idx = len(deduped_verts)
-        snap_to_idx[key] = idx
-        deduped_verts.append((x, y, z))
-        return idx, key
+    deduped_verts = [] # [[x, y, z], ...] — lists for direct IFC use
+    inv_tol = _INV_TOL
 
     # Validate faces and remap indices to deduplicated vertex list
-    valid_faces = []  # list of [idx0, idx1, idx2, ...] (0-based into deduped_verts)
+    valid_faces = []  # list of (idx0+1, idx1+1, ...) tuples (1-based for IFC)
     for indices in face_groups:
         try:
             remapped = []
@@ -73,15 +60,21 @@ def build_ifc_facesets(ifc, verts_scaled: list, face_groups: list) -> list:
             degenerate = False
 
             for i in indices:
-                x = float(verts_scaled[i * 3])
-                y = float(verts_scaled[i * 3 + 1])
-                z = float(verts_scaled[i * 3 + 2])
-                idx, snap_key = get_vertex_index(x, y, z)
-                if snap_key in seen_snaps:
+                i3 = i * 3
+                x = verts_scaled[i3]
+                y = verts_scaled[i3 + 1]
+                z = verts_scaled[i3 + 2]
+                key = (round(x * inv_tol), round(y * inv_tol), round(z * inv_tol))
+                if key in seen_snaps:
                     degenerate = True
                     break
-                seen_snaps.add(snap_key)
-                remapped.append(idx)
+                seen_snaps.add(key)
+                idx = snap_to_idx.get(key)
+                if idx is None:
+                    idx = len(deduped_verts)
+                    snap_to_idx[key] = idx
+                    deduped_verts.append([x, y, z])
+                remapped.append(idx + 1)  # 1-based for IFC
 
             if degenerate or len(remapped) < 3:
                 continue
@@ -94,15 +87,10 @@ def build_ifc_facesets(ifc, verts_scaled: list, face_groups: list) -> list:
 
     # Build IFC entities
     try:
-        point_list = ifc.createIfcCartesianPointList3D(
-            [list(v) for v in deduped_verts]
-        )
-        ifc_faces = []
-        for face_indices in valid_faces:
-            # IfcIndexedPolygonalFace uses 1-based indices
-            coord_index = [idx + 1 for idx in face_indices]
-            ifc_faces.append(ifc.createIfcIndexedPolygonalFace(coord_index))
-
+        point_list = ifc.createIfcCartesianPointList3D(deduped_verts)
+        ifc_faces = [
+            ifc.createIfcIndexedPolygonalFace(fi) for fi in valid_faces
+        ]
         faceset = ifc.createIfcPolygonalFaceSet(point_list, None, ifc_faces, None)
         return [faceset]
     except Exception:
@@ -270,8 +258,10 @@ def decode_faces(faces_raw: list) -> list:
     decoded = []
     i = 0
     total = len(faces_raw)
+    # Check if values are already ints (common after unwrap_chunks)
+    already_int = total > 0 and isinstance(faces_raw[0], int)
     while i < total:
-        n = int(faces_raw[i])
+        n = faces_raw[i] if already_int else int(faces_raw[i])
         if n == 0:
             n = 3
         elif n == 1:
@@ -279,8 +269,10 @@ def decode_faces(faces_raw: list) -> list:
         end = i + 1 + n
         if end > total:
             break
-        # Direct slice is faster than list comprehension with int()
-        decoded.append([int(v) for v in faces_raw[i + 1:end]])
+        if already_int:
+            decoded.append(faces_raw[i + 1:end])
+        else:
+            decoded.append([int(v) for v in faces_raw[i + 1:end]])
         i = end
     return decoded
 
@@ -291,25 +283,55 @@ def decode_faces(faces_raw: list) -> list:
 
 def compute_origin(flat_verts: list) -> tuple:
     """
-    Compute placement origin from scaled vertex list (metres).
+    Compute placement origin from scaled vertex list (mm).
     X, Y = bounding box centroid
     Z = minimum Z (bottom face of element — more natural for IFC)
+    Single-pass to avoid creating 3 sliced copies of a large list.
     """
-    xs = flat_verts[0::3]
-    ys = flat_verts[1::3]
-    zs = flat_verts[2::3]
-    cx = (min(xs) + max(xs)) / 2.0
-    cy = (min(ys) + max(ys)) / 2.0
-    cz = min(zs)
-    return cx, cy, cz
+    x0 = flat_verts[0]
+    y0 = flat_verts[1]
+    z0 = flat_verts[2]
+    xmin = xmax = x0
+    ymin = ymax = y0
+    zmin = z0
+    for i in range(3, len(flat_verts) - 2, 3):
+        x = flat_verts[i]
+        y = flat_verts[i + 1]
+        z = flat_verts[i + 2]
+        if x < xmin:
+            xmin = x
+        elif x > xmax:
+            xmax = x
+        if y < ymin:
+            ymin = y
+        elif y > ymax:
+            ymax = y
+        if z < zmin:
+            zmin = z
+    return (xmin + xmax) / 2.0, (ymin + ymax) / 2.0, zmin
+
+
+# Cache for shared IFC direction/point entities (keyed by ifc file id)
+_shared_entities: dict[int, dict] = {}
+
+
+def _get_shared(ifc):
+    """Return (or create) shared IfcDirection and IfcCartesianPoint entities for this file."""
+    fid = id(ifc)
+    if fid not in _shared_entities:
+        _shared_entities[fid] = {
+            "z_axis": ifc.createIfcDirection([0.0, 0.0, 1.0]),
+            "x_axis": ifc.createIfcDirection([1.0, 0.0, 0.0]),
+            "origin_0": ifc.createIfcCartesianPoint([0.0, 0.0, 0.0]),
+        }
+    return _shared_entities[fid]
 
 
 def _make_placement(ifc, x: float, y: float, z: float):
     """Create an IfcLocalPlacement at absolute world coordinates (metres)."""
+    shared = _get_shared(ifc)
     origin = ifc.createIfcCartesianPoint([x, y, z])
-    z_axis = ifc.createIfcDirection([0.0, 0.0, 1.0])
-    x_axis = ifc.createIfcDirection([1.0, 0.0, 0.0])
-    a2p    = ifc.createIfcAxis2Placement3D(origin, z_axis, x_axis)
+    a2p    = ifc.createIfcAxis2Placement3D(origin, shared["z_axis"], shared["x_axis"])
     return ifc.createIfcLocalPlacement(PlacementRelTo=None, RelativePlacement=a2p)
 
 
@@ -343,7 +365,7 @@ def mesh_to_ifc(
     all_scaled = []
     for mesh in meshes:
         raw_verts = _get(mesh, "vertices") or []
-        verts = unwrap_chunks(list(raw_verts))
+        verts = unwrap_chunks(raw_verts if isinstance(raw_verts, list) else list(raw_verts))
         if not verts:
             mesh_cache.append(None)
             continue
@@ -368,7 +390,7 @@ def mesh_to_ifc(
             continue
         verts, ms, scaled = cached
         raw_faces = _get(mesh, "faces") or []
-        faces_raw = unwrap_chunks(list(raw_faces))
+        faces_raw = unwrap_chunks(raw_faces if isinstance(raw_faces, list) else list(raw_faces))
 
         if not faces_raw:
             continue
@@ -379,10 +401,10 @@ def mesh_to_ifc(
             print(f"  ⚠️  Face decode error: {e}")
             continue
 
-        # Offset pre-scaled vertices relative to origin
+        # Offset pre-scaled vertices relative to origin (flat list, no tuples)
         n = len(scaled)
         verts_scaled = [0.0] * n
-        for vi in range(0, n - 2, 3):
+        for vi in range(0, n, 3):
             verts_scaled[vi]     = scaled[vi]     - ox
             verts_scaled[vi + 1] = scaled[vi + 1] - oy
             verts_scaled[vi + 2] = scaled[vi + 2] - oz

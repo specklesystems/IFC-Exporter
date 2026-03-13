@@ -22,7 +22,7 @@
 
 import math
 from specklepy.objects.base import Base
-from utils.geometry import _get, unwrap_chunks, decode_faces, _UNIT_SCALES, build_ifc_facesets
+from utils.geometry import _get, unwrap_chunks, decode_faces, _UNIT_SCALES, build_ifc_facesets, _get_shared
 
 
 def is_instance(obj) -> bool:
@@ -75,32 +75,6 @@ def build_definition_map(root: Base) -> dict:
     print(f"   Objects indexed by appId:  {len(by_app_id)}")
     print(f"   IFC definition proxies:    {len(ifc_proxies)}")
     print(f"   IFC definition meshes:     {len(ifc_meshes)}")
-
-    # Diagnostic: dump first 3 instanceDefinitionProxies to understand structure
-    print("\n   [PROXY DIAG] First 3 instanceDefinitionProxies from root:")
-    if proxies_raw:
-        sample = proxies_raw if isinstance(proxies_raw, list) else [proxies_raw]
-        for i, proxy in enumerate(sample[:3]):
-            app_id  = _get(proxy, "applicationId") or "?"
-            name    = _get(proxy, "name") or "?"
-            objects = _get(proxy, "objects") or []
-            obj_ids = list(objects)[:3] if objects else []
-            print(f"   [{i}] appId={app_id}")
-            print(f"        name={name}")
-            print(f"        objects={obj_ids} (len={len(list(objects)) if objects else 0})")
-            # Check if first object is found in our maps
-            if obj_ids:
-                oid = str(obj_ids[0])
-                in_by_id     = oid.lower()[:32] in by_id
-                in_by_app_id = oid.lower() in by_app_id
-                print(f"        objects[0]='{oid}' → in by_id: {in_by_id}, in by_app_id: {in_by_app_id}")
-    else:
-        print("   [PROXY DIAG] No instanceDefinitionProxies found on root!")
-        # Check where they might be
-        for key in ["@instanceDefinitionProxies", "instancedefinitionproxies"]:
-            val = _get(root, key)
-            if val:
-                print(f"   Found under key '{key}': {type(val)}")
 
     return {
         "by_id":       by_id,
@@ -217,16 +191,18 @@ def _resolve_instance_scale(obj, stream_scale: float) -> float:
 
 
 # Stats
-_stats   = {"found": 0, "not_found": 0}
-_dbg_cnt = [0]
+_stats = {"found": 0, "not_found": 0}
 
-# Cache: mesh id → (verts_flat, face_groups, ms) to avoid re-unpacking
-# the same definition mesh across many instances that share it.
+# Cache: mesh id → (verts_scaled, face_groups) to avoid re-unpacking
+# AND re-scaling the same definition mesh across many instances that share it.
 _mesh_data_cache: dict = {}
 
 # Cache: definition_id → IfcRepresentationMap (or None if no geometry)
 # All instances sharing the same definition reuse one geometry copy.
 _rep_map_cache: dict = {}
+
+# Shared identity placement for all instances (keyed by ifc file id)
+_identity_placement_cache: dict[int, object] = {}
 
 
 _MM_SCALES = {
@@ -253,7 +229,7 @@ def _build_rep_map(ifc, body_context, meshes: list, ifc_format: bool,
     for mesh in meshes:
         mesh_id = _get(mesh, "id") or _get(mesh, "applicationId")
         if mesh_id and mesh_id in _mesh_data_cache:
-            verts, face_groups, ms = _mesh_data_cache[mesh_id]
+            verts_local, face_groups = _mesh_data_cache[mesh_id]
         else:
             raw_verts = _get(mesh, "vertices") or []
             raw_faces = _get(mesh, "faces") or []
@@ -271,15 +247,11 @@ def _build_rep_map(ifc, body_context, meshes: list, ifc_format: bool,
                 print(f"  ⚠️  Instance face decode: {e}")
                 continue
 
-            if mesh_id:
-                _mesh_data_cache[mesh_id] = (verts, face_groups, ms)
+            # Scale vertices once and cache the result
+            verts_local = [float(v) * ms for v in verts]
 
-        # Scale vertices to mm (local coordinates, no instance transform)
-        verts_local = []
-        for vi in range(0, len(verts) - 2, 3):
-            verts_local.append(float(verts[vi])   * ms)
-            verts_local.append(float(verts[vi+1]) * ms)
-            verts_local.append(float(verts[vi+2]) * ms)
+            if mesh_id:
+                _mesh_data_cache[mesh_id] = (verts_local, face_groups)
 
         mesh_facesets = build_ifc_facesets(ifc, verts_local, face_groups)
 
@@ -298,9 +270,9 @@ def _build_rep_map(ifc, body_context, meshes: list, ifc_format: bool,
     if not geom_items:
         return None
 
-    # Mapping origin = identity (local coords origin)
-    origin = ifc.createIfcCartesianPoint([0.0, 0.0, 0.0])
-    a2p    = ifc.createIfcAxis2Placement3D(origin, None, None)
+    # Mapping origin = identity (local coords origin) — reuse shared origin
+    shared = _get_shared(ifc)
+    a2p    = ifc.createIfcAxis2Placement3D(shared["origin_0"], None, None)
 
     # The mapped representation holds the actual geometry
     mapped_rep = ifc.createIfcShapeRepresentation(
@@ -403,18 +375,13 @@ def instance_to_ifc(ifc, body_context, obj: Base, definition_map: dict,
     # Revit format transform is already in mm (same as IFC file units)
     ts = 1000.0 if ifc_format else _resolve_instance_scale(obj, scale)
 
-    if _dbg_cnt[0] < 6:
-        _dbg_cnt[0] += 1
-        fmt = "IFC" if ifc_format else "Revit"
-        x_axis = (round(t[0],2), round(t[1],2), round(t[2],2))
-        z_axis = (round(t[8],2), round(t[9],2), round(t[10],2))
-        print(f"  [INST {_dbg_cnt[0]} {fmt}] {definition_id[:40]}")
-        print(f"    t[3]={t[3]:.1f} t[7]={t[7]:.1f} t[11]={t[11]:.1f}  x={x_axis}  z={z_axis}")
-
-    # Identity placement (transform is encoded in the MappedItem)
-    origin    = ifc.createIfcCartesianPoint([0.0, 0.0, 0.0])
-    a2p       = ifc.createIfcAxis2Placement3D(origin, None, None)
-    placement = ifc.createIfcLocalPlacement(PlacementRelTo=None, RelativePlacement=a2p)
+    # Identity placement (transform is encoded in the MappedItem) — shared across all instances
+    fid = id(ifc)
+    if fid not in _identity_placement_cache:
+        shared = _get_shared(ifc)
+        a2p = ifc.createIfcAxis2Placement3D(shared["origin_0"], None, None)
+        _identity_placement_cache[fid] = ifc.createIfcLocalPlacement(PlacementRelTo=None, RelativePlacement=a2p)
+    placement = _identity_placement_cache[fid]
 
     # --- Get or build IfcRepresentationMap (cached per definition_id) ---
     if definition_id not in _rep_map_cache:
@@ -497,6 +464,6 @@ def reset_caches():
     """Reset module-level caches (call at start of each export run)."""
     _mesh_data_cache.clear()
     _rep_map_cache.clear()
+    _identity_placement_cache.clear()
     _stats["found"] = 0
     _stats["not_found"] = 0
-    _dbg_cnt[0] = 0

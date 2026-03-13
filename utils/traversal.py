@@ -55,10 +55,10 @@ def get_prop(obj, key: str, default=None):
 
 
 # speckle_type fragments that mark a non-exportable / spatial-structure object
-_SKIP_TYPE_FRAGMENTS = {
-    "Collection", "Level", "Grid", "View", "RenderMaterial",
-    "Site", "Building", "Storey",
-}
+import re
+_SKIP_TYPE_RE = re.compile(
+    r"Collection|Level|Grid|View|RenderMaterial|Site|Building|Storey"
+)
 
 
 def _is_valid_element(obj) -> bool:
@@ -70,10 +70,8 @@ def _is_valid_element(obj) -> bool:
         return False
 
     speckle_type = getattr(obj, "speckle_type", "") or ""
-
-    for fragment in _SKIP_TYPE_FRAGMENTS:
-        if fragment in speckle_type:
-            return False
+    if _SKIP_TYPE_RE.search(speckle_type):
+        return False
 
     return True
 

@@ -7,10 +7,11 @@ maintainers = [{ name = "Speckle Systems", email = "hello@speckle.systems" }]
 description = "A Speckle Automate function template using specklepy"
 readme = "README.md"
 license = "Apache-2.0"
-keywords = ["speckle", "automate", "bim", "aec"]
+keywords = ["speckle", "automate", "bim", "aec", "ifc", "export", "revit"]
 
 dependencies = ["specklepy==3.1.0",
-		"ifcopenshell==0.8.4.post1",]
+		"ifcopenshell==0.8.4.post1",
+		"python-dotenv>=1.0.0",]
 
 [project.optional-dependencies]
 dev = [
