@@ -162,26 +162,37 @@ def automate_function(
                 total += 1
 
             # B2: Instance objects nested inside displayValue
-            # Each becomes its own IFC element (same class as parent)
-            # Use the parent object's name — the InstanceProxy has no meaningful name
+            # All instances are parts of the SAME element (e.g. window frame + glass + sill)
+            # Merge all into a single IFC element with combined geometry
             nested_instances = get_display_instances(obj)
-            for inst in nested_instances:
-                inst_rep, inst_placement = instance_to_ifc(
-                    ifc, body_context, inst, definition_map, scale=scale, material_manager=material_manager
-                )
-                if not inst_rep:
-                    no_geometry += 1
-                    continue
-                inst_element = _create_element(
-                    ifc, ifc_class, name, inst_rep, inst_placement, storey,
-                    storey_manager=storey_manager,
-                    tag=get_element_tag(obj), guid=None,
-                    object_type=getattr(obj, "type", None),
-                )
-                write_properties(ifc, inst_element, obj, ifc_class=ifc_class, category_name=category_name)
-                type_manager.assign(inst_element, obj, ifc_class)
-                instance_count += 1
-                total += 1
+            if nested_instances:
+                mapped_items = []
+                inst_placement = None
+                for inst in nested_instances:
+                    inst_rep, inst_pl = instance_to_ifc(
+                        ifc, body_context, inst, definition_map, scale=scale, material_manager=material_manager
+                    )
+                    if inst_rep:
+                        mapped_items.extend(inst_rep.Items)
+                        if inst_placement is None:
+                            inst_placement = inst_pl
+                if mapped_items:
+                    combined_rep = ifc.createIfcShapeRepresentation(
+                        ContextOfItems=body_context,
+                        RepresentationIdentifier="Body",
+                        RepresentationType="MappedRepresentation",
+                        Items=mapped_items,
+                    )
+                    element = _create_element(
+                        ifc, ifc_class, name, combined_rep, inst_placement, storey,
+                        storey_manager=storey_manager,
+                        tag=get_element_tag(obj), guid=get_ifc_guid(obj),
+                        object_type=getattr(obj, "type", None),
+                    )
+                    write_properties(ifc, element, obj, ifc_class=ifc_class, category_name=category_name)
+                    type_manager.assign(element, obj, ifc_class)
+                    instance_count += 1
+                    total += 1
 
             # Track if neither path produced geometry
             if not rep and not nested_instances:
@@ -205,12 +216,12 @@ def automate_function(
 
     ifc.write(ifc_filename)
     print(f"\n💾 IFC file written: {ifc_filename}")
-    try:
-        automate_context.mark_run_success("Success! You can download the IF file below.")
-        automate_context.store_file_result(f"./{ifc_filename}")
-    except Exception as e:
-        print(f"  ⚠️  Could not upload file result (network issue?): {e}")
-        automate_context.mark_run_failed(f"Something went wrong when storing file result. Exception detail: {e}") 
+    # try:
+    #     automate_context.mark_run_success("Success! You can download the IF file below.")
+    #     automate_context.store_file_result(f"./{ifc_filename}")
+    # except Exception as e:
+    #     print(f"  ⚠️  Could not upload file result (network issue?): {e}")
+    #     automate_context.mark_run_failed(f"Something went wrong when storing file result. Exception detail: {e}") 
 
     print(f"\n{'=' * 60}")
     print(f"  Export complete!")

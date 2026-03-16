@@ -4,9 +4,8 @@
 #
 # Strategy (priority order):
 #   1. builtInCategory (OST_ enum from properties.builtInCategory) — most reliable
-#   2. speckle_type prefix match — for typed Speckle objects
-#   3. category_name string (traversal context) — display name fallback
-#   4. IfcBuildingElementProxy — last resort
+#   2. category_name string (traversal context) — display name fallback
+#   3. IfcBuildingElementProxy — last resort
 #
 # builtInCategory values: https://www.revitapidocs.com/2019/ba1c5b30-242f-5fdc-8ea9-ec3b61e6e722.htm
 # =============================================================================
@@ -119,44 +118,7 @@ BUILTIN_CATEGORY_MAP: dict[str, str] = {
 }
 
 
-# --- speckle_type → IFC class (secondary lookup) ---
-SPECKLE_TYPE_MAP: dict[str, str] = {
-    "Objects.BuiltElements.Wall":                        "IfcWall",
-    "Objects.BuiltElements.Floor":                       "IfcSlab",
-    "Objects.BuiltElements.Roof":                        "IfcRoof",
-    "Objects.BuiltElements.Column":                      "IfcColumn",
-    "Objects.BuiltElements.Beam":                        "IfcBeam",
-    "Objects.BuiltElements.Brace":                       "IfcMember",
-    "Objects.BuiltElements.Duct":                        "IfcDuctSegment",
-    "Objects.BuiltElements.Pipe":                        "IfcPipeSegment",
-    "Objects.BuiltElements.Wire":                        "IfcCableCarrierSegment",
-    "Objects.BuiltElements.Opening":                     "IfcOpeningElement",
-    "Objects.BuiltElements.Room":                        "IfcSpace",
-    "Objects.BuiltElements.Ceiling":                     "IfcCovering",
-    "Objects.BuiltElements.Stair":                       "IfcStair",
-    "Objects.BuiltElements.Ramp":                        "IfcRamp",
-    "Objects.BuiltElements.Foundation":                  "IfcFooting",
-    "Objects.BuiltElements.Grid":                        "IfcGrid",
-    "Objects.BuiltElements.Level":                       "IfcBuildingStorey",
-    "Objects.BuiltElements.Revit.RevitWall":             "IfcWall",
-    "Objects.BuiltElements.Revit.RevitFloor":            "IfcSlab",
-    "Objects.BuiltElements.Revit.RevitRoof":             "IfcRoof",
-    "Objects.BuiltElements.Revit.RevitColumn":           "IfcColumn",
-    "Objects.BuiltElements.Revit.RevitBeam":             "IfcBeam",
-    "Objects.BuiltElements.Revit.RevitBrace":            "IfcMember",
-    "Objects.BuiltElements.Revit.RevitDuct":             "IfcDuctSegment",
-    "Objects.BuiltElements.Revit.RevitPipe":             "IfcPipeSegment",
-    "Objects.BuiltElements.Revit.RevitRoom":             "IfcSpace",
-    "Objects.BuiltElements.Revit.RevitStair":            "IfcStair",
-    "Objects.BuiltElements.Revit.RevitRailing":          "IfcRailing",
-    "Objects.BuiltElements.Revit.RevitCeiling":          "IfcCovering",
-    "Objects.BuiltElements.Revit.RevitTopography":       "IfcGeographicElement",
-    "Objects.BuiltElements.Revit.RevitElementType":      "IfcBuildingElementProxy",
-    "Objects.Geometry.Mesh":                             "IfcBuildingElementProxy",
-    "Objects.Geometry.Brep":                             "IfcBuildingElementProxy",
-}
-
-# --- Display category name → IFC class (tertiary fallback) ---
+# --- Display category name → IFC class (secondary fallback) ---
 CATEGORY_MAP: dict[str, str] = {
     "Walls":                        "IfcWall",
     "Floors":                       "IfcSlab",
@@ -235,11 +197,6 @@ def _get_builtin_category(obj) -> str | None:
     return result
 
 
-# Pre-computed: sorted prefixes longest-first for early exit on prefix match
-_SPECKLE_PREFIXES: list[tuple[str, str]] = sorted(
-    SPECKLE_TYPE_MAP.items(), key=lambda x: len(x[0]), reverse=True
-)
-
 # Pre-computed lowercase category map for substring matching
 _CATEGORY_MAP_LOWER: list[tuple[str, str]] = [
     (k.lower(), v) for k, v in CATEGORY_MAP.items()
@@ -255,10 +212,9 @@ def classify(obj, category_name: str = "") -> str:
 
     Priority:
       1. properties.builtInCategory (OST_ enum) — definitive Revit classification
-      2. speckle_type prefix match
-      3. category_name from traversal context (display string)
-      4. obj.category field
-      5. IfcBuildingElementProxy fallback
+      2. category_name from traversal context (display string)
+      3. obj.category field
+      4. IfcBuildingElementProxy fallback
     """
     cache_key = (id(obj), category_name)
     if cache_key in _classify_cache:
@@ -275,16 +231,7 @@ def _classify_impl(obj, category_name: str) -> str:
     if bic and bic in BUILTIN_CATEGORY_MAP:
         return BUILTIN_CATEGORY_MAP[bic]
 
-    # 2. speckle_type — exact match first, then longest-prefix match
-    speckle_type = getattr(obj, "speckle_type", "") or ""
-    if speckle_type:
-        if speckle_type in SPECKLE_TYPE_MAP:
-            return SPECKLE_TYPE_MAP[speckle_type]
-        for prefix, ifc_class in _SPECKLE_PREFIXES:
-            if speckle_type.startswith(prefix):
-                return ifc_class
-
-    # 3. category_name from traversal context — exact match first
+    # 2. category_name from traversal context — exact match first
     if category_name:
         if category_name in CATEGORY_MAP:
             return CATEGORY_MAP[category_name]
@@ -293,7 +240,7 @@ def _classify_impl(obj, category_name: str) -> str:
             if key_lower in cat_lower:
                 return ifc_class
 
-    # 4. obj.category field
+    # 3. obj.category field
     obj_category = getattr(obj, "category", None)
     if obj_category and isinstance(obj_category, str):
         if obj_category in CATEGORY_MAP:

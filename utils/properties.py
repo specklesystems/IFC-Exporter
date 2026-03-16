@@ -644,7 +644,7 @@ def write_material_quantities(ifc, element, obj: Base):
     Source: properties."Material Quantities".<MaterialName>.{area, volume, density,
             materialName, materialClass, materialCategory}
 
-    Each material produces one IfcElementQuantity named "Qto_<MaterialName>" with:
+    Each material produces one IfcElementQuantity named "Qto_<MaterialName>BaseQuantities" with:
       - GrossArea      (IfcQuantityArea)
       - GrossVolume    (IfcQuantityVolume)
       - Density        (IfcPropertySingleValue — no standard IFC quantity type)
@@ -711,7 +711,7 @@ def write_material_quantities(ifc, element, obj: Base):
             continue
 
         # Create IfcElementQuantity and link via IfcRelDefinesByProperties
-        qto_name = f"Qto_{mat_name}"
+        qto_name = f"Qto_{mat_name}BaseQuantities"
         try:
             qto = ifcopenshell.api.run(
                 "pset.add_qto", ifc,
@@ -723,6 +723,103 @@ def write_material_quantities(ifc, element, obj: Base):
             print(f"  ⚠️  {qto_name}: {e}")
 
 
+# ---------------------------------------------------------------------------
+# Qto_<EntityType>BaseQuantities — standard element-level quantities
+# ---------------------------------------------------------------------------
+
+# IFC entity → Qto name (only entities with standard Qto sets)
+_ENTITY_QTO_NAME: dict[str, str] = {
+    "IfcWall":                      "Qto_WallBaseQuantities",
+    "IfcWallStandardCase":          "Qto_WallBaseQuantities",
+    "IfcSlab":                      "Qto_SlabBaseQuantities",
+    "IfcColumn":                    "Qto_ColumnBaseQuantities",
+    "IfcBeam":                      "Qto_BeamBaseQuantities",
+    "IfcDoor":                      "Qto_DoorBaseQuantities",
+    "IfcWindow":                    "Qto_WindowBaseQuantities",
+    "IfcRoof":                      "Qto_RoofBaseQuantities",
+    "IfcCovering":                  "Qto_CoveringBaseQuantities",
+    "IfcRailing":                   "Qto_RailingBaseQuantities",
+    "IfcStair":                     "Qto_StairBaseQuantities",
+    "IfcRamp":                      "Qto_RampBaseQuantities",
+    "IfcMember":                    "Qto_MemberBaseQuantities",
+    "IfcFooting":                   "Qto_FootingBaseQuantities",
+    "IfcCurtainWall":               "Qto_CurtainWallBaseQuantities",
+    "IfcBuildingElementProxy":      "Qto_BuildingElementProxyBaseQuantities",
+}
+
+# IFC quantity name → (IFC entity type, value attribute, [Revit param fallbacks])
+# First matching Revit param wins for each quantity name.
+_ELEMENT_QUANTITY_DEFS: list[tuple[str, str, str, list[str]]] = [
+    ("GrossArea",   "IfcQuantityArea",   "AreaValue",   ["HOST_AREA_COMPUTED"]),
+    ("GrossVolume", "IfcQuantityVolume",  "VolumeValue", ["HOST_VOLUME_COMPUTED"]),
+    ("Length",      "IfcQuantityLength",  "LengthValue", [
+        "CURVE_ELEM_LENGTH", "INSTANCE_LENGTH_PARAM",
+    ]),
+    ("Height",      "IfcQuantityLength",  "LengthValue", [
+        "WALL_USER_HEIGHT_PARAM", "FAMILY_HEIGHT_PARAM",
+        "INSTANCE_HEAD_HEIGHT_PARAM",
+    ]),
+    ("Width",       "IfcQuantityLength",  "LengthValue", [
+        "INSTANCE_WIDTH_PARAM", "FURNITURE_WIDTH",
+        "FLOOR_ATTR_THICKNESS_PARAM",
+    ]),
+    ("Perimeter",   "IfcQuantityLength",  "LengthValue", [
+        "HOST_PERIMETER_COMPUTED",
+    ]),
+]
+
+
+def write_element_quantities(ifc, element, obj: Base, ifc_class: str = ""):
+    """
+    Write Qto_<EntityType>BaseQuantities from Revit computed instance parameters.
+
+    Reads HOST_AREA_COMPUTED, HOST_VOLUME_COMPUTED, CURVE_ELEM_LENGTH,
+    FURNITURE_WIDTH, FAMILY_HEIGHT_PARAM, etc.
+    IfcSpace is handled separately in _write_space_properties.
+    """
+    if ifc_class == "IfcSpace":
+        return  # Already handled by Qto_SpaceBaseQuantities
+
+    qto_name = _ENTITY_QTO_NAME.get(ifc_class)
+    if not qto_name:
+        return
+
+    props = _get_props_dict(obj)
+    params = _safe_get(props, "Parameters", {})
+    inst_params = _safe_get(params, "Instance Parameters", {})
+    if not inst_params:
+        return
+
+    quantities = []
+
+    for qty_name, ifc_entity, value_attr, revit_params in _ELEMENT_QUANTITY_DEFS:
+        val = None
+        for internal_name in revit_params:
+            val = _param_value(inst_params, internal_name)
+            if val is not None:
+                break
+        if val is None:
+            continue
+        try:
+            q = ifc.create_entity(ifc_entity, Name=qty_name, **{value_attr: float(val)})
+            quantities.append(q)
+        except Exception:
+            pass
+
+    if not quantities:
+        return
+
+    try:
+        qto = ifcopenshell.api.run(
+            "pset.add_qto", ifc,
+            product=element,
+            name=qto_name,
+        )
+        qto.Quantities = quantities
+    except Exception as e:
+        print(f"  ⚠️  {qto_name}: {e}")
+
+
 def write_properties(ifc, element, obj: Base, ifc_class: str = "", category_name: str = ""):
     """
     Write all property sets for an IFC element, matching Revit native IFC export structure:
@@ -731,10 +828,12 @@ def write_properties(ifc, element, obj: Base, ifc_class: str = "", category_name
       3. RVT_TypeParameters       — all remaining Revit type parameters
       4. RVT_InstanceParameters   — all remaining Revit instance parameters
       5. RVT_Identity             — family, type, elementId, builtInCategory
-      6. Qto_<MaterialName>       — material quantities (area, volume, density)
+      6. Qto_<EntityType>BaseQuantities   — element-level quantities (area, volume, length)
+      7. Qto_<MaterialName>BaseQuantities — material quantities (area, volume, density)
     """
     write_common_pset(ifc, element, obj, ifc_class, category_name)
     write_revit_params(ifc, element, obj)
+    write_element_quantities(ifc, element, obj, ifc_class)
     write_material_quantities(ifc, element, obj)
 
 
