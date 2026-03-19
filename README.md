@@ -12,6 +12,7 @@ The exporter receives a Speckle model version, walks its object tree, and produc
 - Revit property sets (Common psets, instance/type parameters, material quantities)
 - IFC type objects (IfcWallType, IfcSlabType, etc.) shared across instances
 - Spatial structure (IfcProject > IfcSite > IfcBuilding > IfcBuildingStorey)
+- IfcSpace elements aggregated under storeys with Room properties
 
 ## Pipeline Overview
 
@@ -33,7 +34,7 @@ Speckle Model
     │   ├── Classify → IFC entity class
     │   ├── Convert geometry → IfcPolygonalFaceSet
     │   ├── Create IFC element + placement
-    │   ├── Write property sets
+    │   ├── Write property sets & quantities
     │   └── Assign IFC type object
     │
     ▼
@@ -52,19 +53,19 @@ Speckle Model
 | `utils/mapper.py` | Classifies Speckle objects into IFC entity types |
 | `utils/geometry.py` | Converts Speckle meshes to IfcPolygonalFaceSet geometry |
 | `utils/instances.py` | Handles InstanceProxy objects with shared geometry (IfcMappedItem) |
-| `utils/properties.py` | Writes IFC property sets from Revit parameters |
+| `utils/properties.py` | Writes IFC property sets and quantities from Revit parameters |
 | `utils/type_manager.py` | Creates and caches IfcTypeObjects (IfcWallType, etc.) |
 | `utils/materials.py` | Maps Speckle render materials to IfcSurfaceStyle colours |
 | `utils/writer.py` | Creates the IFC file scaffold and manages storey creation |
-| `utils/config.py` | Project/site/building name configuration |
+| `utils/receiver.py` | Connects to Speckle server and receives model data (uses `.env`) |
 
 ## Mapping Logic
 
-Classification of Speckle objects to IFC entity types follows a priority chain with three lookup tables. The first match wins.
+Classification of Speckle objects to IFC entity types follows a priority chain. The first match wins.
 
 ### Priority 1: `builtInCategory` (OST_ enum)
 
-The most reliable source. Read from `obj.properties.builtInCategory`, which contains the Revit `BuiltInCategory` enum value. This is a direct Revit classification and maps unambiguously to IFC.
+The most reliable source. Read from `obj.properties.builtInCategory`, which contains the Revit `BuiltInCategory` enum value.
 
 Examples:
 | builtInCategory | IFC Class |
@@ -81,23 +82,11 @@ Examples:
 | `OST_PipeCurves` | `IfcPipeSegment` |
 | `OST_LightingFixtures` | `IfcLightFixture` |
 | `OST_Furniture` | `IfcFurnishingElement` |
+| `OST_Rooms` | `IfcSpace` |
 
 The full table covers ~70 Revit categories across Architectural, Structural, MEP (HVAC, Plumbing, Electrical), and Site/Civil disciplines.
 
-### Priority 2: `speckle_type` prefix
-
-For typed Speckle objects, the `speckle_type` string is matched. Exact match is tried first, then longest-prefix match.
-
-Examples:
-| speckle_type | IFC Class |
-|---|---|
-| `Objects.BuiltElements.Wall` | `IfcWall` |
-| `Objects.BuiltElements.Floor` | `IfcSlab` |
-| `Objects.BuiltElements.Revit.RevitWall` | `IfcWall` |
-| `Objects.BuiltElements.Revit.RevitColumn` | `IfcColumn` |
-| `Objects.Geometry.Mesh` | `IfcBuildingElementProxy` |
-
-### Priority 3: Category name (display string)
+### Priority 2: Category name (display string)
 
 The category name from the traversal context (the name of the parent Collection in the Speckle tree). Exact match first, then case-insensitive substring match.
 
@@ -109,9 +98,9 @@ Examples:
 | `Plumbing Fixtures` | `IfcSanitaryTerminal` |
 | `Lighting Fixtures` | `IfcLightFixture` |
 
-### Priority 4: `obj.category` field
+### Priority 3: `obj.category` field
 
-Same lookup as Priority 3, but using the object's own `category` attribute.
+Same lookup as Priority 2, but using the object's own `category` attribute.
 
 ### Fallback
 
@@ -136,7 +125,11 @@ Speckle `InstanceProxy` objects reference shared definition geometry via `defini
 - **Revit format**: `definitionId` is a 64-char hex hash; geometry is found by walking the object tree
 - **IFC format**: `definitionId` starts with `DEFINITION:`; geometry is in `definitionGeometry` collection
 
-Performance optimisation: geometry is built once as an `IfcRepresentationMap`, then each instance references it via `IfcMappedItem` + `IfcCartesianTransformationOperator3DnonUniform`. This avoids duplicating vertex data across hundreds of identical elements (e.g. chairs, light fixtures, curtain wall panels).
+Performance optimisation: geometry is built once as an `IfcRepresentationMap`, then each instance references it via `IfcMappedItem` + `IfcCartesianTransformationOperator3DnonUniform`. This avoids duplicating vertex data across hundreds of identical elements.
+
+### Composite Objects (Path B2 — merged instances)
+
+Objects like Windows and Doors may have multiple `InstanceProxy` items in their `displayValue` (e.g. frame, glass, sill). These are **not** separate IFC elements — all instance geometries are merged into a single `IfcShapeRepresentation` with combined `IfcMappedItem` entries, producing one IFC element per Speckle object.
 
 ## Property Sets
 
@@ -145,11 +138,44 @@ The exporter writes property sets matching Revit's native IFC export structure:
 | Property Set | Content |
 |---|---|
 | `Pset_<Entity>Common` | Standard IFC properties: Reference, IsExternal, LoadBearing, ThermalTransmittance |
-| `RVT_TypeParameters` | All Revit type parameters (written on the IfcTypeObject) |
+| `Pset_SpaceCommon` | Room-specific: Reference, RoomNumber, RoomName, Category (Occupant) |
 | `RVT_InstanceParameters` | All Revit instance parameters |
 | `RVT_Identity` | Family, Type, ElementId, BuiltInCategory |
-| `Qto_<MaterialName>` | Material quantities: area, volume, density |
 
+## Quantities
+
+Quantities follow the IFC standard naming convention: `Qto_<EntityType>BaseQuantities` and `Qto_<MaterialName>BaseQuantities`.
+
+| Quantity Set | Content |
+|---|---|
+| `Qto_<EntityType>BaseQuantities` | Element-level quantities from Revit computed parameters (area, volume, length, width, height, perimeter) |
+| `Qto_SpaceBaseQuantities` | Room quantities: NetFloorArea, NetVolume |
+| `Qto_<MaterialName>BaseQuantities` | Per-material quantities: GrossArea, GrossVolume, Density |
+
+### Element Quantity Mapping
+
+| IFC Quantity | Revit Parameter(s) |
+|---|---|
+| GrossArea | `HOST_AREA_COMPUTED` |
+| GrossVolume | `HOST_VOLUME_COMPUTED` |
+| Length | `CURVE_ELEM_LENGTH`, `INSTANCE_LENGTH_PARAM` |
+| Height | `WALL_USER_HEIGHT_PARAM`, `FAMILY_HEIGHT_PARAM`, `INSTANCE_HEAD_HEIGHT_PARAM` |
+| Width | `INSTANCE_WIDTH_PARAM`, `FURNITURE_WIDTH`, `FLOOR_ATTR_THICKNESS_PARAM` |
+| Perimeter | `HOST_PERIMETER_COMPUTED` |
+
+### Supported Entity Qto Sets
+
+`Qto_WallBaseQuantities`, `Qto_SlabBaseQuantities`, `Qto_ColumnBaseQuantities`, `Qto_BeamBaseQuantities`, `Qto_DoorBaseQuantities`, `Qto_WindowBaseQuantities`, `Qto_RoofBaseQuantities`, `Qto_CoveringBaseQuantities`, `Qto_RailingBaseQuantities`, `Qto_StairBaseQuantities`, `Qto_RampBaseQuantities`, `Qto_MemberBaseQuantities`, `Qto_FootingBaseQuantities`, `Qto_CurtainWallBaseQuantities`, `Qto_BuildingElementProxyBaseQuantities`
+
+## IfcSpace (Rooms)
+
+Revit Rooms (`OST_Rooms`) are exported as `IfcSpace` elements with special handling:
+
+- **Spatial relationship**: Aggregated under `IfcBuildingStorey` via `IfcRelAggregates` (not contained)
+- **Naming**: Uses the Speckle object `name` attribute (not Family:Type which is "none:none" for rooms)
+- **IfcSpace.Name**: Set to `ROOM_NUMBER`
+- **IfcSpace.LongName**: Set to `ROOM_NAME`
+- **Geometry**: Converted from `displayValue` meshes like any other element
 
 ## Function Inputs
 
@@ -159,6 +185,16 @@ The exporter writes property sets matching Revit's native IFC export structure:
 | `IFC_PROJECT_NAME` | Name for the IfcProject entity |
 | `IFC_SITE_NAME` | Name for the IfcSite entity |
 | `IFC_BUILDING_NAME` | Name for the IfcBuilding entity |
+
+## Environment Variables
+
+For local testing via `receiver.py`, configure a `.env` file:
+
+| Variable | Description |
+|---|---|
+| `SPECKLE_SERVER_URL` | Speckle server URL (default: `https://app.speckle.systems`) |
+| `SPECKLE_TOKEN` | Personal access token for authentication |
+| `SPECKLE_PROJECT_ID` | Project (stream) ID |
 
 ## Testing
 
