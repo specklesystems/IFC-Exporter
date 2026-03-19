@@ -1,4 +1,4 @@
-# Speckle to IFC 4.3 Exporter
+# Speckle-Revit to IFC 4.3 Exporter
 
 A [Speckle Automate](https://automate.speckle.dev/) function that converts Speckle BIM models (primarily from Revit) into IFC 4.3 files using [ifcopenshell](https://ifcopenshell.org/).
 
