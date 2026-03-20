@@ -11,6 +11,8 @@
 #     for compact output — each vertex stored once, not once per face.
 # =============================================================================
 
+import math
+
 import ifcopenshell
 from specklepy.objects.base import Base
 
@@ -243,6 +245,181 @@ def get_display_instances(obj: Base) -> list:
         if instances:
             break
     return instances
+
+
+# --------------------------------------------------------------------------- #
+# Curve detection & extraction (Lines, Arcs)
+# --------------------------------------------------------------------------- #
+
+def _is_line(item) -> bool:
+    """Detect Objects.Geometry.Line (but not Polyline)."""
+    if item is None:
+        return False
+    st = _get(item, "speckle_type") or ""
+    return "Line" in st and "Polyline" not in st
+
+
+def _is_arc(item) -> bool:
+    """Detect Objects.Geometry.Arc."""
+    if item is None:
+        return False
+    st = _get(item, "speckle_type") or ""
+    return "Arc" in st
+
+
+def get_display_curves(obj: Base) -> list:
+    """Extract Line and Arc objects from a DataObject's displayValue."""
+    curves = []
+    for key in ["displayValue", "@displayValue"]:
+        display = _get(obj, key)
+        if display is None:
+            continue
+        items = display if isinstance(display, list) else [display]
+        for item in items:
+            if _is_line(item) or _is_arc(item):
+                curves.append(item)
+        if curves:
+            break
+    return curves
+
+
+def _point_coords(pt, fallback_scale: float) -> tuple:
+    """Extract (x, y, z) from a Speckle Point, scaled to mm."""
+    scale = _resolve_scale(pt, fallback_scale)
+    x = float(_get(pt, "x") or 0.0) * scale
+    y = float(_get(pt, "y") or 0.0) * scale
+    z = float(_get(pt, "z") or 0.0) * scale
+    return x, y, z
+
+
+def _arc_to_points(arc, scale: float, num_segments: int = 8) -> list:
+    """
+    Approximate a Speckle Arc as a list of (x, y, z) points in mm.
+    Uses plane origin (center), radius, and domain angles for parametric sampling.
+    Falls back to start/mid/end points if plane data is missing.
+    """
+    plane = _get(arc, "plane")
+    radius = _get(arc, "radius")
+    domain = _get(arc, "domain")
+
+    if not plane or not radius or not domain:
+        points = []
+        for key in ["startPoint", "midPoint", "endPoint"]:
+            pt = _get(arc, key)
+            if pt:
+                points.append(_point_coords(pt, scale))
+        return points if len(points) >= 2 else []
+
+    origin = _get(plane, "origin")
+    xdir = _get(plane, "xdir")
+    ydir = _get(plane, "ydir")
+
+    if not origin or not xdir or not ydir:
+        points = []
+        for key in ["startPoint", "midPoint", "endPoint"]:
+            pt = _get(arc, key)
+            if pt:
+                points.append(_point_coords(pt, scale))
+        return points if len(points) >= 2 else []
+
+    cx, cy, cz = _point_coords(origin, scale)
+    # Direction vectors are unitless — do not scale
+    dxx = float(_get(xdir, "x") or 0.0)
+    dxy = float(_get(xdir, "y") or 0.0)
+    dxz = float(_get(xdir, "z") or 0.0)
+    dyx = float(_get(ydir, "x") or 0.0)
+    dyy = float(_get(ydir, "y") or 0.0)
+    dyz = float(_get(ydir, "z") or 0.0)
+
+    r = float(radius) * scale
+    t_start = float(_get(domain, "start") or 0.0)
+    t_end = float(_get(domain, "end") or 0.0)
+
+    points = []
+    for i in range(num_segments + 1):
+        t = t_start + (t_end - t_start) * i / num_segments
+        cos_t = math.cos(t)
+        sin_t = math.sin(t)
+        x = cx + r * (cos_t * dxx + sin_t * dyx)
+        y = cy + r * (cos_t * dxy + sin_t * dyy)
+        z = cz + r * (cos_t * dxz + sin_t * dyz)
+        points.append((x, y, z))
+    return points
+
+
+def curves_to_ifc(
+    ifc: ifcopenshell.file,
+    body_context,
+    obj: Base,
+    scale: float = 0.001,
+    material_manager=None,
+) -> tuple:
+    """
+    Convert Speckle Line/Arc objects in displayValue to IFC curve geometry.
+    Lines → IfcPolyline (2 points), Arcs → IfcPolyline (sampled points).
+    Wrapped in IfcGeometricCurveSet.
+    Returns (IfcShapeRepresentation, IfcLocalPlacement) or (None, None).
+    """
+    curves = get_display_curves(obj)
+    if not curves:
+        return None, None
+
+    obj_scale = _resolve_scale(obj, scale)
+    polylines = []
+    all_points = []
+
+    for curve in curves:
+        cs = _resolve_scale(curve, obj_scale)
+
+        if _is_line(curve):
+            start = _get(curve, "start")
+            end = _get(curve, "end")
+            if not start or not end:
+                continue
+            p1 = _point_coords(start, cs)
+            p2 = _point_coords(end, cs)
+            all_points.extend([p1, p2])
+            polylines.append([p1, p2])
+
+        elif _is_arc(curve):
+            pts = _arc_to_points(curve, cs)
+            if len(pts) >= 2:
+                all_points.extend(pts)
+                polylines.append(pts)
+
+    if not polylines or not all_points:
+        return None, None
+
+    # Compute origin from all curve points
+    xs = [p[0] for p in all_points]
+    ys = [p[1] for p in all_points]
+    zs = [p[2] for p in all_points]
+    ox = (min(xs) + max(xs)) / 2.0
+    oy = (min(ys) + max(ys)) / 2.0
+    oz = min(zs)
+
+    # Build IfcPolylines offset from origin
+    ifc_polylines = []
+    for pts in polylines:
+        ifc_points = [
+            ifc.createIfcCartesianPoint([p[0] - ox, p[1] - oy, p[2] - oz])
+            for p in pts
+        ]
+        ifc_polylines.append(ifc.createIfcPolyline(ifc_points))
+
+    if not ifc_polylines:
+        return None, None
+
+    curve_set = ifc.createIfcGeometricCurveSet(ifc_polylines)
+
+    rep = ifc.createIfcShapeRepresentation(
+        ContextOfItems=body_context,
+        RepresentationIdentifier="Body",
+        RepresentationType="GeometricCurveSet",
+        Items=[curve_set],
+    )
+    placement = _make_placement(ifc, ox, oy, oz)
+    return rep, placement
 
 
 # --------------------------------------------------------------------------- #

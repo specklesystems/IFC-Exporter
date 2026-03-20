@@ -5,7 +5,7 @@ import ifcopenshell.api
 from utils.materials import MaterialManager
 from utils.traversal import traverse, print_tree
 from utils.mapper import classify, reset_caches as reset_mapper_caches
-from utils.geometry import mesh_to_ifc, get_display_instances, _make_placement
+from utils.geometry import mesh_to_ifc, get_display_instances, curves_to_ifc, _make_placement
 from utils.instances import is_instance, instance_to_ifc, build_definition_map, print_instance_stats, get_definition_object
 from utils.properties import write_properties, write_common_properties, build_element_name, get_element_tag, get_ifc_guid, reset_caches as reset_props_caches
 from utils.writer import create_ifc_scaffold, StoreyManager
@@ -106,6 +106,9 @@ def automate_function(
 
         ifc_class = classify(obj, category_name)
 
+        if ifc_class is None:
+            continue
+
         if ifc_class in SPATIAL_STRUCTURE_TYPES:
             skipped_spatial += 1
             continue
@@ -194,9 +197,20 @@ def automate_function(
                     instance_count += 1
                     total += 1
 
-            # Track if neither path produced geometry
+            # B3: Curve geometry (Lines, Arcs in displayValue)
             if not rep and not nested_instances:
-                no_geometry += 1
+                curve_rep, curve_placement = curves_to_ifc(ifc, body_context, obj, scale=scale, material_manager=material_manager)
+                if curve_rep:
+                    element = _create_element(ifc, ifc_class, name, curve_rep, curve_placement, storey,
+                                                 storey_manager=storey_manager,
+                                                 tag=get_element_tag(obj), guid=get_ifc_guid(obj),
+                                                 object_type=getattr(obj, "type", None),
+                    )
+                    write_properties(ifc, element, obj, ifc_class=ifc_class, category_name=category_name)
+                    type_manager.assign(element, obj, ifc_class)
+                    total += 1
+                else:
+                    no_geometry += 1
 
         if total % 100 == 0:
             print(f"  ... processed {total} elements")

@@ -62,6 +62,7 @@ BUILTIN_CATEGORY_MAP: dict[str, str] = {
     "OST_StructuralStiffener":              "IfcMember",
     "OST_StructuralTruss":                  "IfcMember",
     "OST_StructuralConnectionModel":        "IfcMechanicalFastener",
+    "OST_StructConnections":                "IfcMechanicalFastener",
     "OST_Rebar":                            "IfcReinforcingBar",
     "OST_FabricAreas":                      "IfcReinforcingMesh",
     "OST_FabricReinforcement":              "IfcReinforcingMesh",
@@ -81,6 +82,7 @@ BUILTIN_CATEGORY_MAP: dict[str, str] = {
     "OST_PipeAccessory":                    "IfcPipeSegment",
     "OST_FlexPipeCurves":                   "IfcPipeSegment",
     "OST_PlumbingFixtures":                 "IfcSanitaryTerminal",
+    "OST_PlumbingEquipment":                "IfcSanitaryTerminal",
     "OST_Sprinklers":                       "IfcFireSuppressionTerminal",
 
     # MEP - Electrical
@@ -118,6 +120,21 @@ BUILTIN_CATEGORY_MAP: dict[str, str] = {
 }
 
 
+# --- OST categories to skip entirely (analytical / energy / separation lines) ---
+SKIP_CATEGORIES: set[str] = {
+    "OST_MEPLoadAreaSeparationLines",
+    "OST_EnergyAnalysisZones",
+    "OST_EnergyAnalysisSurface",
+    "OST_SolarShading",
+    "OST_MEPAnalyticalPipeSegments",
+    "OST_MEPAnalyticalDuctSegments",
+    "OST_MEPAnalyticalSpaces",
+    "OST_ElectricalConduitAnalyticalLines",
+    "OST_MEPLoadBoundaryLines",
+    "OST_FlowTerminalSeparationLines",
+}
+
+
 # --- Display category name → IFC class (secondary fallback) ---
 CATEGORY_MAP: dict[str, str] = {
     "Walls":                        "IfcWall",
@@ -146,10 +163,13 @@ CATEGORY_MAP: dict[str, str] = {
     "Furniture Systems":            "IfcFurnishingElement",
     "Casework":                     "IfcFurnishingElement",
     "Plumbing Fixtures":            "IfcSanitaryTerminal",
+    "Plumbing Equipment":           "IfcSanitaryTerminal",
     "Electrical Fixtures":          "IfcElectricAppliance",
     "Lighting Fixtures":            "IfcLightFixture",
     "Mechanical Equipment":         "IfcUnitaryEquipment",
     "Electrical Equipment":         "IfcElectricDistributionBoard",
+    "Structural Rebar":             "IfcReinforcingBar",
+    "Structural Connections":       "IfcMechanicalFastener",
     "Structural Foundations":       "IfcFooting",
     "Foundation Slabs":             "IfcSlab",
     "Topography":                   "IfcGeographicElement",
@@ -206,7 +226,7 @@ _CATEGORY_MAP_LOWER: list[tuple[str, str]] = [
 _classify_cache: dict[tuple, str] = {}
 
 
-def classify(obj, category_name: str = "") -> str:
+def classify(obj, category_name: str = "") -> str | None:
     """
     Determine the IFC class for a Speckle object.
 
@@ -225,9 +245,13 @@ def classify(obj, category_name: str = "") -> str:
     return result
 
 
-def _classify_impl(obj, category_name: str) -> str:
-    # 1. builtInCategory — most reliable, direct Revit enum
+def _classify_impl(obj, category_name: str) -> str | None:
+    # 0. Skip analytical / energy / separation-line categories
     bic = _get_builtin_category(obj)
+    if bic and bic in SKIP_CATEGORIES:
+        return None
+
+    # 1. builtInCategory — most reliable, direct Revit enum
     if bic and bic in BUILTIN_CATEGORY_MAP:
         return BUILTIN_CATEGORY_MAP[bic]
 

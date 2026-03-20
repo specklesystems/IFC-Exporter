@@ -1,6 +1,6 @@
 # Speckle to IFC 4.3 Exporter
 
-A [Speckle Automate](https://automate.speckle.dev/) function that converts Speckle BIM models (primarily from Revit) into IFC 4.3 files using [ifcopenshell](https://ifcopenshell.org/).
+A [Speckle Automate](https://automate.speckle.dev/) function that converts Speckle Revit models into IFC 4.3 files using [ifcopenshell](https://ifcopenshell.org/). This exporter is specifically designed for models sent to Speckle from Autodesk Revit and relies on Revit-specific object structures, categories, and parameters.
 
 ## What It Does
 
@@ -8,11 +8,13 @@ The exporter receives a Speckle model version, walks its object tree, and produc
 
 - Correct IFC entity classification (IfcWall, IfcSlab, IfcColumn, etc.)
 - Tessellated geometry (IfcPolygonalFaceSet)
+- Curve geometry for Lines and Arcs (IfcGeometricCurveSet with IfcPolyline)
 - Material colours from Speckle render materials
 - Revit property sets (Common psets, instance/type parameters, material quantities)
 - IFC type objects (IfcWallType, IfcSlabType, etc.) shared across instances
 - Spatial structure (IfcProject > IfcSite > IfcBuilding > IfcBuildingStorey)
 - IfcSpace elements aggregated under storeys with Room properties
+- Automatic skipping of analytical/energy categories (e.g. Energy Analysis, MEP Analytical, Solar Shading)
 
 ## Pipeline Overview
 
@@ -31,8 +33,8 @@ Speckle Model
     ▼
 4. Traverse object tree
     │   For each leaf element:
-    │   ├── Classify → IFC entity class
-    │   ├── Convert geometry → IfcPolygonalFaceSet
+    │   ├── Classify → IFC entity class (skip analytical categories)
+    │   ├── Convert geometry → IfcPolygonalFaceSet or IfcGeometricCurveSet
     │   ├── Create IFC element + placement
     │   ├── Write property sets & quantities
     │   └── Assign IFC type object
@@ -51,7 +53,7 @@ Speckle Model
 | `main.py` | Entry point, orchestrates the full pipeline |
 | `utils/traversal.py` | Walks the Speckle Collection tree (Project > Level > Category > Element) |
 | `utils/mapper.py` | Classifies Speckle objects into IFC entity types |
-| `utils/geometry.py` | Converts Speckle meshes to IfcPolygonalFaceSet geometry |
+| `utils/geometry.py` | Converts Speckle meshes to IfcPolygonalFaceSet and Lines/Arcs to IfcGeometricCurveSet geometry |
 | `utils/instances.py` | Handles InstanceProxy objects with shared geometry (IfcMappedItem) |
 | `utils/properties.py` | Writes IFC property sets and quantities from Revit parameters |
 | `utils/type_manager.py` | Creates and caches IfcTypeObjects (IfcWallType, etc.) |
@@ -80,11 +82,21 @@ Examples:
 | `OST_CurtainWallPanels` | `IfcCurtainWall` |
 | `OST_DuctCurves` | `IfcDuctSegment` |
 | `OST_PipeCurves` | `IfcPipeSegment` |
+| `OST_PipeFitting` | `IfcPipeFitting` |
+| `OST_PlumbingEquipment` | `IfcSanitaryTerminal` |
+| `OST_Rebar` | `IfcReinforcingBar` |
+| `OST_StructConnections` | `IfcMechanicalFastener` |
 | `OST_LightingFixtures` | `IfcLightFixture` |
 | `OST_Furniture` | `IfcFurnishingElement` |
 | `OST_Rooms` | `IfcSpace` |
 
 The full table covers ~70 Revit categories across Architectural, Structural, MEP (HVAC, Plumbing, Electrical), and Site/Civil disciplines.
+
+### Skipped Categories
+
+The following analytical/energy OST categories are automatically skipped (not exported to IFC):
+
+`OST_MEPLoadAreaSeparationLines`, `OST_EnergyAnalysisZones`, `OST_EnergyAnalysisSurface`, `OST_SolarShading`, `OST_MEPAnalyticalPipeSegments`, `OST_MEPAnalyticalDuctSegments`, `OST_MEPAnalyticalSpaces`, `OST_ElectricalConduitAnalyticalLines`, `OST_MEPLoadBoundaryLines`, `OST_FlowTerminalSeparationLines`
 
 ### Priority 2: Category name (display string)
 
@@ -96,6 +108,8 @@ Examples:
 | `Walls` | `IfcWall` |
 | `Structural Columns` | `IfcColumn` |
 | `Plumbing Fixtures` | `IfcSanitaryTerminal` |
+| `Structural Rebar` | `IfcReinforcingBar` |
+| `Structural Connections` | `IfcMechanicalFastener` |
 | `Lighting Fixtures` | `IfcLightFixture` |
 
 ### Priority 3: `obj.category` field
@@ -126,6 +140,15 @@ Speckle `InstanceProxy` objects reference shared definition geometry via `defini
 - **IFC format**: `definitionId` starts with `DEFINITION:`; geometry is in `definitionGeometry` collection
 
 Performance optimisation: geometry is built once as an `IfcRepresentationMap`, then each instance references it via `IfcMappedItem` + `IfcCartesianTransformationOperator3DnonUniform`. This avoids duplicating vertex data across hundreds of identical elements.
+
+### Curve Geometry (Path B3)
+
+Objects whose `displayValue` contains `Objects.Geometry.Line` or `Objects.Geometry.Arc` items (and no meshes or instances) are exported as curve geometry:
+
+- **Lines** → `IfcPolyline` with start and end points
+- **Arcs** → `IfcPolyline` approximated with 8 segments, sampled parametrically from the arc's plane origin, radius, and domain angles. Falls back to start/mid/end points if plane data is unavailable.
+
+All curves are wrapped in an `IfcGeometricCurveSet` inside an `IfcShapeRepresentation` with `RepresentationType="GeometricCurveSet"`.
 
 ### Composite Objects (Path B2 — merged instances)
 
@@ -165,7 +188,7 @@ Quantities follow the IFC standard naming convention: `Qto_<EntityType>BaseQuant
 
 ### Supported Entity Qto Sets
 
-`Qto_WallBaseQuantities`, `Qto_SlabBaseQuantities`, `Qto_ColumnBaseQuantities`, `Qto_BeamBaseQuantities`, `Qto_DoorBaseQuantities`, `Qto_WindowBaseQuantities`, `Qto_RoofBaseQuantities`, `Qto_CoveringBaseQuantities`, `Qto_RailingBaseQuantities`, `Qto_StairBaseQuantities`, `Qto_RampBaseQuantities`, `Qto_MemberBaseQuantities`, `Qto_FootingBaseQuantities`, `Qto_CurtainWallBaseQuantities`, `Qto_BuildingElementProxyBaseQuantities`
+`Qto_WallBaseQuantities`, `Qto_SlabBaseQuantities`, `Qto_ColumnBaseQuantities`, `Qto_BeamBaseQuantities`, `Qto_DoorBaseQuantities`, `Qto_WindowBaseQuantities`, `Qto_RoofBaseQuantities`, `Qto_CoveringBaseQuantities`, `Qto_RailingBaseQuantities`, `Qto_StairBaseQuantities`, `Qto_RampBaseQuantities`, `Qto_MemberBaseQuantities`, `Qto_FootingBaseQuantities`, `Qto_CurtainWallBaseQuantities`, `Qto_BuildingElementProxyBaseQuantities`, `Qto_PipeFittingBaseQuantities`, `Qto_SanitaryTerminalBaseQuantities`, `Qto_ReinforcingElementBaseQuantities`, `Qto_MechanicalFastenerBaseQuantities`
 
 ## IfcSpace (Rooms)
 

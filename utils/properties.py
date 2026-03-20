@@ -53,6 +53,10 @@ COMMON_PSET: dict[str, str] = {
     "IfcOpeningElement":            "Pset_OpeningElementCommon",
     "IfcPlate":                     "Pset_PlateCommon",
     "IfcGeographicElement":         "Pset_SiteCommon",
+    "IfcPipeFitting":               "Pset_PipeFittingTypeCommon",
+    "IfcSanitaryTerminal":          "Pset_SanitaryTerminalTypeCommon",
+    "IfcReinforcingBar":            "Pset_ReinforcingBarBendingsBECCommon",
+    "IfcMechanicalFastener":        "Pset_MechanicalFastenerTypeCommon",
 }
 
 # ---------------------------------------------------------------------------
@@ -745,6 +749,10 @@ _ENTITY_QTO_NAME: dict[str, str] = {
     "IfcFooting":                   "Qto_FootingBaseQuantities",
     "IfcCurtainWall":               "Qto_CurtainWallBaseQuantities",
     "IfcBuildingElementProxy":      "Qto_BuildingElementProxyBaseQuantities",
+    "IfcPipeFitting":               "Qto_PipeFittingBaseQuantities",
+    "IfcSanitaryTerminal":          "Qto_SanitaryTerminalBaseQuantities",
+    "IfcReinforcingBar":            "Qto_ReinforcingElementBaseQuantities",
+    "IfcMechanicalFastener":        "Qto_MechanicalFastenerBaseQuantities",
 }
 
 # IFC quantity name → (IFC entity type, value attribute, [Revit param fallbacks])
