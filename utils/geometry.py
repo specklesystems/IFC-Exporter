@@ -55,34 +55,47 @@ def build_ifc_facesets(ifc, verts_scaled: list, face_groups: list) -> list:
 
     # Validate faces and remap indices to deduplicated vertex list
     valid_faces = []  # list of (idx0+1, idx1+1, ...) tuples (1-based for IFC)
+    vert_len = len(verts_scaled)
     for indices in face_groups:
-        try:
-            remapped = []
-            seen_snaps = set()
-            degenerate = False
-
-            for i in indices:
-                i3 = i * 3
-                x = verts_scaled[i3]
-                y = verts_scaled[i3 + 1]
-                z = verts_scaled[i3 + 2]
-                key = (round(x * inv_tol), round(y * inv_tol), round(z * inv_tol))
-                if key in seen_snaps:
-                    degenerate = True
-                    break
-                seen_snaps.add(key)
-                idx = snap_to_idx.get(key)
-                if idx is None:
-                    idx = len(deduped_verts)
-                    snap_to_idx[key] = idx
-                    deduped_verts.append([x, y, z])
-                remapped.append(idx + 1)  # 1-based for IFC
-
-            if degenerate or len(remapped) < 3:
-                continue
-            valid_faces.append(remapped)
-        except Exception:
+        if indices is None:
             continue
+        if not isinstance(indices, (list, tuple)):
+            continue
+
+        remapped = []
+        seen_snaps = set()
+        degenerate = False
+        invalid = False
+
+        for i in indices:
+            if not isinstance(i, int):
+                invalid = True
+                break
+
+            i3 = i * 3
+            if i3 < 0 or i3 + 2 >= vert_len:
+                invalid = True
+                break
+
+            x = verts_scaled[i3]
+            y = verts_scaled[i3 + 1]
+            z = verts_scaled[i3 + 2]
+            key = (round(x * inv_tol), round(y * inv_tol), round(z * inv_tol))
+            if key in seen_snaps:
+                degenerate = True
+                break
+            seen_snaps.add(key)
+
+            idx = snap_to_idx.get(key)
+            if idx is None:
+                idx = len(deduped_verts)
+                snap_to_idx[key] = idx
+                deduped_verts.append([x, y, z])
+            remapped.append(idx + 1)  # 1-based for IFC
+
+        if invalid or degenerate or len(remapped) < 3:
+            continue
+        valid_faces.append(remapped)
 
     if not valid_faces or not deduped_verts:
         return []
