@@ -1,3 +1,4 @@
+import zipfile
 from datetime import datetime
 
 import ifcopenshell.api
@@ -5,8 +6,9 @@ import ifcopenshell.api
 from utils.materials import MaterialManager
 from utils.traversal import traverse, print_tree
 from utils.mapper import classify, reset_caches as reset_mapper_caches
-from utils.geometry import mesh_to_ifc, get_display_instances, curves_to_ifc, _make_placement
-from utils.instances import is_instance, instance_to_ifc, build_definition_map, print_instance_stats, get_definition_object
+from utils.geometry import mesh_to_ifc, get_display_instances, _make_placement
+from utils.curves import curve_to_ifc
+from utils.instances import is_instance, instance_to_ifc, build_definition_map, print_instance_stats, get_definition_object, reset_caches as reset_instance_caches
 from utils.properties import write_properties, write_common_properties, build_element_name, get_element_tag, get_ifc_guid, reset_caches as reset_props_caches
 from utils.writer import create_ifc_scaffold, StoreyManager
 from utils.type_manager import TypeManager
@@ -61,6 +63,7 @@ def automate_function(
     # Reset caches from any previous run
     reset_props_caches()
     reset_mapper_caches()
+    reset_instance_caches()
 
     # ------------------------------------------------------------------ #
     # 1. Receive
@@ -199,7 +202,7 @@ def automate_function(
 
             # B3: Curve geometry (Lines, Arcs in displayValue)
             if not rep and not nested_instances:
-                curve_rep, curve_placement = curves_to_ifc(ifc, body_context, obj, scale=scale, material_manager=material_manager)
+                curve_rep, curve_placement = curve_to_ifc(ifc, body_context, obj, scale=scale, material_manager=material_manager)
                 if curve_rep:
                     element = _create_element(ifc, ifc_class, name, curve_rep, curve_placement, storey,
                                                  storey_manager=storey_manager,
@@ -230,11 +233,17 @@ def automate_function(
 
     ifc.write(ifc_filename)
     print(f"\n💾 IFC file written: {ifc_filename}")
+
+    zip_filename = f"{file_name}_{timestamp}.zip"
+    with zipfile.ZipFile(zip_filename, "w", zipfile.ZIP_DEFLATED) as zf:
+        zf.write(ifc_filename)
+    print(f"Zipped: {zip_filename}")
+
     try:
-        automate_context.mark_run_success("Success! You can download the IF file below.")
-        automate_context.store_file_result(f"./{ifc_filename}")
+        automate_context.mark_run_success("Success! You can download the IFC file below.")
+        automate_context.store_file_result(f"./{zip_filename}")
     except Exception as e:
-        print(f"  ⚠️  Could not upload file result (network issue?): {e}")
+        print(f"  Could not upload file result (network issue?): {e}")
         automate_context.mark_run_failed(f"Something went wrong when storing file result. Exception detail: {e}") 
 
     print(f"\n{'=' * 60}")

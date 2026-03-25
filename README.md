@@ -16,7 +16,7 @@ The exporter receives a Speckle model version, walks its object tree, and produc
 
 - Correct IFC entity classification (IfcWall, IfcSlab, IfcColumn, etc.)
 - Tessellated geometry (IfcPolygonalFaceSet)
-- Curve geometry for Lines and Arcs (IfcGeometricCurveSet with IfcPolyline)
+- Curve geometry for Lines, Arcs, and Polycurves (IfcIndexedPolyCurve with IfcLineIndex/IfcArcIndex)
 - Material colours from Speckle render materials
 - Revit property sets (Common psets, instance/type parameters, material quantities)
 - IFC type objects (IfcWallType, IfcSlabType, etc.) shared across instances
@@ -42,7 +42,7 @@ Speckle Model
 4. Traverse object tree
     │   For each leaf element:
     │   ├── Classify → IFC entity class (skip analytical categories)
-    │   ├── Convert geometry → IfcPolygonalFaceSet or IfcGeometricCurveSet
+    │   ├── Convert geometry → IfcPolygonalFaceSet or IfcIndexedPolyCurve
     │   ├── Create IFC element + placement
     │   ├── Write property sets & quantities
     │   └── Assign IFC type object
@@ -61,8 +61,10 @@ Speckle Model
 | `main.py` | Entry point, orchestrates the full pipeline |
 | `utils/traversal.py` | Walks the Speckle Collection tree (Project > Level > Category > Element) |
 | `utils/mapper.py` | Classifies Speckle objects into IFC entity types |
-| `utils/geometry.py` | Converts Speckle meshes to IfcPolygonalFaceSet and Lines/Arcs to IfcGeometricCurveSet geometry |
-| `utils/instances.py` | Handles InstanceProxy objects with shared geometry (IfcMappedItem) |
+| `utils/helpers.py` | Shared utilities (`_get` safe accessor, `MM_SCALES` unit conversion) |
+| `utils/geometry.py` | Converts Speckle meshes to IfcPolygonalFaceSet geometry (handles nested BrepX) |
+| `utils/curves.py` | Converts Lines, Arcs, and Polycurves to IfcIndexedPolyCurve geometry |
+| `utils/instances.py` | Handles InstanceProxy objects with shared geometry (IfcMappedItem), content-based deduplication |
 | `utils/properties.py` | Writes IFC property sets and quantities from Revit parameters |
 | `utils/type_manager.py` | Creates and caches IfcTypeObjects (IfcWallType, etc.) |
 | `utils/materials.py` | Maps Speckle render materials to IfcSurfaceStyle colours |
@@ -134,11 +136,12 @@ If none of the above match, the object is classified as `IfcBuildingElementProxy
 
 Objects with `displayValue` containing Mesh objects are converted directly:
 
-1. Extract vertices and faces from each mesh in `displayValue`
+1. Extract vertices and faces from each mesh in `displayValue` (recursively handles nested BrepX/Brep objects)
 2. Scale vertices to millimetres based on the mesh's unit declaration
 3. Deduplicate vertices via snap grid (0.01mm tolerance) to avoid IFC GEM111 errors
-4. Build `IfcPolygonalFaceSet` with `IfcCartesianPointList3D` + `IfcIndexedPolygonalFace`
-5. Compute bounding box origin for `IfcLocalPlacement`, offset vertices relative to it
+4. Round vertex coordinates to 0.001mm precision for smaller IFC file output
+5. Build `IfcPolygonalFaceSet` with `IfcCartesianPointList3D` + `IfcIndexedPolygonalFace`
+6. Compute bounding box origin incrementally for `IfcLocalPlacement`, offset vertices relative to it
 
 ### Instance Objects (Path A / B2)
 
@@ -147,16 +150,17 @@ Speckle `InstanceProxy` objects reference shared definition geometry via `defini
 - **Revit format**: `definitionId` is a 64-char hex hash; geometry is found by walking the object tree
 - **IFC format**: `definitionId` starts with `DEFINITION:`; geometry is in `definitionGeometry` collection
 
-Performance optimisation: geometry is built once as an `IfcRepresentationMap`, then each instance references it via `IfcMappedItem` + `IfcCartesianTransformationOperator3DnonUniform`. This avoids duplicating vertex data across hundreds of identical elements.
+Performance optimisation: geometry is built once as an `IfcRepresentationMap`, then each instance references it via `IfcMappedItem` + `IfcCartesianTransformationOperator3DnonUniform`. This avoids duplicating vertex data across hundreds of identical elements. Content-based hashing further deduplicates definitions that share identical geometry.
 
 ### Curve Geometry (Path B3)
 
-Objects whose `displayValue` contains `Objects.Geometry.Line` or `Objects.Geometry.Arc` items (and no meshes or instances) are exported as curve geometry:
+Objects whose `displayValue` contains `Objects.Geometry.Line`, `Objects.Geometry.Arc`, or `Objects.Geometry.Polycurve` items (and no meshes or instances) are exported as curve geometry using native IFC curve types:
 
-- **Lines** → `IfcPolyline` with start and end points
-- **Arcs** → `IfcPolyline` approximated with 8 segments, sampled parametrically from the arc's plane origin, radius, and domain angles. Falls back to start/mid/end points if plane data is unavailable.
+- **Lines** → `IfcLineIndex` segments (start/end points)
+- **Arcs** → `IfcArcIndex` segments (start/mid/end points)
+- **Polycurves** → Mixed `IfcLineIndex` and `IfcArcIndex` segments from the polycurve's segment list (supports Line, Arc, and Polyline sub-segments)
 
-All curves are wrapped in an `IfcGeometricCurveSet` inside an `IfcShapeRepresentation` with `RepresentationType="GeometricCurveSet"`.
+All curves use `IfcIndexedPolyCurve` with `IfcCartesianPointList3D` for compact, deduplicated point storage. The representation uses `RepresentationType="Curve3D"`.
 
 ### Composite Objects (Path B2 — merged instances)
 

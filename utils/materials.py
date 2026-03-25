@@ -64,6 +64,7 @@ class MaterialManager:
         self._style_map: dict[str, object] = {}
         # name → IfcSurfaceStyle (cache to avoid duplicates)
         self._style_cache: dict[str, object] = {}
+        self._apply_count: int = 0
         self._build(root)
 
     def _build(self, root: Base):
@@ -134,6 +135,24 @@ class MaterialManager:
         style = self._get_or_create_style(name, diffuse, transparency)
         self._style_map[key] = style
         return style
+
+    def get_style_with_fallbacks(self, primary_app_id: str = None,
+                                 fallback_app_ids: list = None,
+                                 definition_id: str = None):
+        """Try primary app_id first, then each fallback, then definition_id. Return style or None."""
+        if primary_app_id:
+            style = self.get_style(primary_app_id)
+            if style:
+                return style
+        for aid in (fallback_app_ids or []):
+            style = self.get_style(aid)
+            if style:
+                return style
+        if definition_id:
+            style = self.get_style(definition_id)
+            if style:
+                return style
+        return None
 
     def apply_to_item(self, item, mesh_app_id: str):
         """Assign the material style to a single IFC geometry item (e.g. IfcPolygonalFaceSet)."""

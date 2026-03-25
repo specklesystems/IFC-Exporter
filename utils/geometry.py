@@ -1,6 +1,6 @@
 # =============================================================================
 # geometry.py
-# Converts Speckle DataObject geometry → IFC IfcPolygonalFaceSet + IfcLocalPlacement
+# Converts Speckle DataObject geometry -> IFC IfcPolygonalFaceSet + IfcLocalPlacement
 #
 # Key facts:
 #   - After specklepy receive(), vertices and faces are FLAT Python lists
@@ -8,23 +8,12 @@
 #   - Units are in mm (for Revit), scale to metres for IFC
 #   - Vertices are in absolute world coordinates
 #   - Uses IfcPolygonalFaceSet (indexed vertices) instead of IfcFacetedBrep
-#     for compact output — each vertex stored once, not once per face.
+#     for compact output -- each vertex stored once, not once per face.
 # =============================================================================
-
-import math
 
 import ifcopenshell
 from specklepy.objects.base import Base
-
-
-# Scale factors → MILLIMETRES (IFC file is declared as mm)
-_UNIT_SCALES = {
-    "mm": 1.0,    "millimeter": 1.0,    "millimeters": 1.0,
-    "cm": 10.0,   "centimeter": 10.0,   "centimeters": 10.0,
-    "m":  1000.0, "meter": 1000.0,      "meters": 1000.0,
-    "ft": 304.8,  "foot": 304.8,        "feet": 304.8,
-    "in": 25.4,   "inch": 25.4,         "inches": 25.4,
-}
+from utils.helpers import _get, MM_SCALES as _UNIT_SCALES
 
 
 # --------------------------------------------------------------------------- #
@@ -49,8 +38,8 @@ def build_ifc_facesets(ifc, verts_scaled: list, face_groups: list) -> list:
     face_groups:  list of index lists [[i,j,k], [i,j,k,l], ...]
     Returns: list of IfcPolygonalFaceSet (typically one, empty on failure).
     """
-    snap_to_idx = {}   # snap_key → 0-based index in deduped_verts
-    deduped_verts = [] # [[x, y, z], ...] — lists for direct IFC use
+    snap_to_idx = {}   # snap_key -> 0-based index in deduped_verts
+    deduped_verts = [] # [[x, y, z], ...] -- lists for direct IFC use
     inv_tol = _INV_TOL
 
     # Validate faces and remap indices to deduplicated vertex list
@@ -87,6 +76,13 @@ def build_ifc_facesets(ifc, verts_scaled: list, face_groups: list) -> list:
     if not valid_faces or not deduped_verts:
         return []
 
+    # Round vertex coordinates to reduce IFC text file size
+    # 3 decimal places = 0.001mm precision (more than sufficient)
+    for v in deduped_verts:
+        v[0] = round(v[0], 3)
+        v[1] = round(v[1], 3)
+        v[2] = round(v[2], 3)
+
     # Build IFC entities
     try:
         point_list = ifc.createIfcCartesianPointList3D(deduped_verts)
@@ -99,39 +95,15 @@ def build_ifc_facesets(ifc, verts_scaled: list, face_groups: list) -> list:
         return []
 
 
-# --------------------------------------------------------------------------- #
-# Safe data access helpers
-# --------------------------------------------------------------------------- #
-
-def _get(obj, key, default=None):
-    """
-    Safe access for specklepy Base objects.
-    Tries attribute access first, then bracket access.
-    """
-    try:
-        val = getattr(obj, key, None)
-        if val is not None:
-            return val
-    except Exception:
-        pass
-    try:
-        val = obj[key]
-        if val is not None:
-            return val
-    except Exception:
-        pass
-    return default
-
-
 def unwrap_chunks(raw) -> list:
     """
     Flatten a Speckle data array into a plain Python list of numbers.
 
     Handles two cases:
       1. Already flat list of numbers (after specklepy receive deserializes)
-         → returned as-is (fast path)
+         -> returned as-is (fast path)
       2. List of DataChunk objects (raw from server before deserialization)
-         → each chunk's .data list is concatenated
+         -> each chunk's .data list is concatenated
     """
     if not raw:
         return []
@@ -163,7 +135,7 @@ def unwrap_chunks(raw) -> list:
 
 
 def _resolve_scale(obj, stream_scale: float) -> float:
-    """Resolve unit scale: obj.units → stream fallback."""
+    """Resolve unit scale: obj.units -> stream fallback."""
     units = _get(obj, "units")
     if units and isinstance(units, str):
         return _UNIT_SCALES.get(units.lower().strip(), stream_scale)
@@ -177,7 +149,7 @@ def _resolve_scale(obj, stream_scale: float) -> float:
 def _is_mesh(item) -> bool:
     """
     Detect if a specklepy object is a Mesh.
-    Uses speckle_type string — more reliable than hasattr on Base objects.
+    Uses speckle_type string -- more reliable than hasattr on Base objects.
     """
     if item is None:
         return False
@@ -190,23 +162,39 @@ def _is_mesh(item) -> bool:
     return verts is not None and faces is not None
 
 
-def get_display_meshes(obj: Base) -> list:
+def _collect_meshes_from_display(obj) -> list:
     """
-    Extract all Mesh objects from a DataObject's displayValue.
-    displayValue is always an array per the Speckle schema docs.
+    Collect Mesh objects from an object's displayValue.
+    If an item is not a Mesh (e.g. BrepX, Brep), recursively check
+    its own displayValue for nested meshes.
     """
     meshes = []
-
-    for key in ["displayValue", "@displayValue"]:
+    for key in ["displayValue", "@displayValue", "_displayValue"]:
         display = _get(obj, key)
         if display is None:
             continue
         items = display if isinstance(display, list) else [display]
         for item in items:
+            if item is None:
+                continue
             if _is_mesh(item):
                 meshes.append(item)
+            else:
+                # BrepX / Brep / other geometry types may carry a nested
+                # displayValue with the tessellated mesh representation
+                meshes.extend(_collect_meshes_from_display(item))
         if meshes:
-            break  # found meshes, don't check @displayValue too
+            break
+    return meshes
+
+
+def get_display_meshes(obj: Base) -> list:
+    """
+    Extract all Mesh objects from a DataObject's displayValue.
+    Handles nested geometry types (BrepX, Brep) that wrap meshes
+    inside their own displayValue.
+    """
+    meshes = _collect_meshes_from_display(obj)
 
     # Fallback: object itself is a Mesh
     if not meshes and _is_mesh(obj):
@@ -227,10 +215,10 @@ def get_display_instances(obj: Base) -> list:
       - definitionId: "DEFINITION:{meshAppId}" string
       - units:        "m"
 
-    Raw meshes do NOT appear in displayValue in IFC→Speckle exports.
+    Raw meshes do NOT appear in displayValue in IFC->Speckle exports.
     """
     instances = []
-    for key in ["displayValue", "@displayValue"]:
+    for key in ["displayValue", "@displayValue", "_displayValue"]:
         display = _get(obj, key)
         if display is None:
             continue
@@ -248,181 +236,6 @@ def get_display_instances(obj: Base) -> list:
 
 
 # --------------------------------------------------------------------------- #
-# Curve detection & extraction (Lines, Arcs)
-# --------------------------------------------------------------------------- #
-
-def _is_line(item) -> bool:
-    """Detect Objects.Geometry.Line (but not Polyline)."""
-    if item is None:
-        return False
-    st = _get(item, "speckle_type") or ""
-    return "Line" in st and "Polyline" not in st
-
-
-def _is_arc(item) -> bool:
-    """Detect Objects.Geometry.Arc."""
-    if item is None:
-        return False
-    st = _get(item, "speckle_type") or ""
-    return "Arc" in st
-
-
-def get_display_curves(obj: Base) -> list:
-    """Extract Line and Arc objects from a DataObject's displayValue."""
-    curves = []
-    for key in ["displayValue", "@displayValue"]:
-        display = _get(obj, key)
-        if display is None:
-            continue
-        items = display if isinstance(display, list) else [display]
-        for item in items:
-            if _is_line(item) or _is_arc(item):
-                curves.append(item)
-        if curves:
-            break
-    return curves
-
-
-def _point_coords(pt, fallback_scale: float) -> tuple:
-    """Extract (x, y, z) from a Speckle Point, scaled to mm."""
-    scale = _resolve_scale(pt, fallback_scale)
-    x = float(_get(pt, "x") or 0.0) * scale
-    y = float(_get(pt, "y") or 0.0) * scale
-    z = float(_get(pt, "z") or 0.0) * scale
-    return x, y, z
-
-
-def _arc_to_points(arc, scale: float, num_segments: int = 8) -> list:
-    """
-    Approximate a Speckle Arc as a list of (x, y, z) points in mm.
-    Uses plane origin (center), radius, and domain angles for parametric sampling.
-    Falls back to start/mid/end points if plane data is missing.
-    """
-    plane = _get(arc, "plane")
-    radius = _get(arc, "radius")
-    domain = _get(arc, "domain")
-
-    if not plane or not radius or not domain:
-        points = []
-        for key in ["startPoint", "midPoint", "endPoint"]:
-            pt = _get(arc, key)
-            if pt:
-                points.append(_point_coords(pt, scale))
-        return points if len(points) >= 2 else []
-
-    origin = _get(plane, "origin")
-    xdir = _get(plane, "xdir")
-    ydir = _get(plane, "ydir")
-
-    if not origin or not xdir or not ydir:
-        points = []
-        for key in ["startPoint", "midPoint", "endPoint"]:
-            pt = _get(arc, key)
-            if pt:
-                points.append(_point_coords(pt, scale))
-        return points if len(points) >= 2 else []
-
-    cx, cy, cz = _point_coords(origin, scale)
-    # Direction vectors are unitless — do not scale
-    dxx = float(_get(xdir, "x") or 0.0)
-    dxy = float(_get(xdir, "y") or 0.0)
-    dxz = float(_get(xdir, "z") or 0.0)
-    dyx = float(_get(ydir, "x") or 0.0)
-    dyy = float(_get(ydir, "y") or 0.0)
-    dyz = float(_get(ydir, "z") or 0.0)
-
-    r = float(radius) * scale
-    t_start = float(_get(domain, "start") or 0.0)
-    t_end = float(_get(domain, "end") or 0.0)
-
-    points = []
-    for i in range(num_segments + 1):
-        t = t_start + (t_end - t_start) * i / num_segments
-        cos_t = math.cos(t)
-        sin_t = math.sin(t)
-        x = cx + r * (cos_t * dxx + sin_t * dyx)
-        y = cy + r * (cos_t * dxy + sin_t * dyy)
-        z = cz + r * (cos_t * dxz + sin_t * dyz)
-        points.append((x, y, z))
-    return points
-
-
-def curves_to_ifc(
-    ifc: ifcopenshell.file,
-    body_context,
-    obj: Base,
-    scale: float = 0.001,
-    material_manager=None,
-) -> tuple:
-    """
-    Convert Speckle Line/Arc objects in displayValue to IFC curve geometry.
-    Lines → IfcPolyline (2 points), Arcs → IfcPolyline (sampled points).
-    Wrapped in IfcGeometricCurveSet.
-    Returns (IfcShapeRepresentation, IfcLocalPlacement) or (None, None).
-    """
-    curves = get_display_curves(obj)
-    if not curves:
-        return None, None
-
-    obj_scale = _resolve_scale(obj, scale)
-    polylines = []
-    all_points = []
-
-    for curve in curves:
-        cs = _resolve_scale(curve, obj_scale)
-
-        if _is_line(curve):
-            start = _get(curve, "start")
-            end = _get(curve, "end")
-            if not start or not end:
-                continue
-            p1 = _point_coords(start, cs)
-            p2 = _point_coords(end, cs)
-            all_points.extend([p1, p2])
-            polylines.append([p1, p2])
-
-        elif _is_arc(curve):
-            pts = _arc_to_points(curve, cs)
-            if len(pts) >= 2:
-                all_points.extend(pts)
-                polylines.append(pts)
-
-    if not polylines or not all_points:
-        return None, None
-
-    # Compute origin from all curve points
-    xs = [p[0] for p in all_points]
-    ys = [p[1] for p in all_points]
-    zs = [p[2] for p in all_points]
-    ox = (min(xs) + max(xs)) / 2.0
-    oy = (min(ys) + max(ys)) / 2.0
-    oz = min(zs)
-
-    # Build IfcPolylines offset from origin
-    ifc_polylines = []
-    for pts in polylines:
-        ifc_points = [
-            ifc.createIfcCartesianPoint([p[0] - ox, p[1] - oy, p[2] - oz])
-            for p in pts
-        ]
-        ifc_polylines.append(ifc.createIfcPolyline(ifc_points))
-
-    if not ifc_polylines:
-        return None, None
-
-    curve_set = ifc.createIfcGeometricCurveSet(ifc_polylines)
-
-    rep = ifc.createIfcShapeRepresentation(
-        ContextOfItems=body_context,
-        RepresentationIdentifier="Body",
-        RepresentationType="GeometricCurveSet",
-        Items=[curve_set],
-    )
-    placement = _make_placement(ifc, ox, oy, oz)
-    return rep, placement
-
-
-# --------------------------------------------------------------------------- #
 # Face decoding
 # --------------------------------------------------------------------------- #
 
@@ -430,7 +243,7 @@ def decode_faces(faces_raw: list) -> list:
     """
     Decode Speckle's run-length encoded face list into vertex index groups.
     Format: [n, i0, i1, ..., n, i0, i1, ...]
-      n=0 → triangle (legacy), n=1 → quad (legacy), n≥3 → n-gon
+      n=0 -> triangle (legacy), n=1 -> quad (legacy), n>=3 -> n-gon
     """
     decoded = []
     i = 0
@@ -462,7 +275,7 @@ def compute_origin(flat_verts: list) -> tuple:
     """
     Compute placement origin from scaled vertex list (mm).
     X, Y = bounding box centroid
-    Z = minimum Z (bottom face of element — more natural for IFC)
+    Z = minimum Z (bottom face of element -- more natural for IFC)
     Single-pass to avoid creating 3 sliced copies of a large list.
     """
     x0 = flat_verts[0]
@@ -505,9 +318,9 @@ def _get_shared(ifc):
 
 
 def _make_placement(ifc, x: float, y: float, z: float):
-    """Create an IfcLocalPlacement at absolute world coordinates (metres)."""
+    """Create an IfcLocalPlacement at absolute world coordinates (mm)."""
     shared = _get_shared(ifc)
-    origin = ifc.createIfcCartesianPoint([x, y, z])
+    origin = ifc.createIfcCartesianPoint([round(x, 3), round(y, 3), round(z, 3)])
     a2p    = ifc.createIfcAxis2Placement3D(origin, shared["z_axis"], shared["x_axis"])
     return ifc.createIfcLocalPlacement(PlacementRelTo=None, RelativePlacement=a2p)
 
@@ -524,7 +337,7 @@ def mesh_to_ifc(
     material_manager=None,
 ) -> tuple:
     """
-    Convert a Speckle DataObject → (IfcShapeRepresentation, IfcLocalPlacement).
+    Convert a Speckle DataObject -> (IfcShapeRepresentation, IfcLocalPlacement).
     Creates one IfcPolygonalFaceSet per mesh so each can carry its own material style.
     Returns (None, None) if no usable geometry is found.
     """
@@ -532,14 +345,21 @@ def mesh_to_ifc(
     if not meshes:
         return None, None
 
+    # Parent object's applicationId -- used as fallback for material lookup
+    # when inner meshes (e.g. from BrepX) don't have their own applicationId
+    obj_app_id = _get(obj, "applicationId")
+
     obj_scale = _resolve_scale(obj, scale)
 
     # ------------------------------------------------------------------ #
-    # Pass 1: unpack vertices once per mesh, collect all scaled coords
-    #         to compute world origin. Cache (verts, ms) for Pass 2.
+    # Pass 1: unpack and scale vertices once per mesh, compute origin
+    #         incrementally without accumulating all vertices in memory.
     # ------------------------------------------------------------------ #
-    mesh_cache = []   # [(verts_list, ms, scaled)] or None per mesh
-    all_scaled = []
+    mesh_cache = []   # [scaled_verts_list] or None per mesh
+    xmin = ymin = zmin = float("inf")
+    xmax = ymax = float("-inf")
+    has_verts = False
+
     for mesh in meshes:
         raw_verts = _get(mesh, "vertices") or []
         verts = unwrap_chunks(raw_verts if isinstance(raw_verts, list) else list(raw_verts))
@@ -547,25 +367,34 @@ def mesh_to_ifc(
             mesh_cache.append(None)
             continue
         ms = _resolve_scale(mesh, obj_scale)
-        # Pre-scale vertices once, reuse in Pass 2
         scaled = [float(v) * ms for v in verts]
-        mesh_cache.append((verts, ms, scaled))
-        all_scaled.extend(scaled)
+        mesh_cache.append(scaled)
+        has_verts = True
 
-    if not all_scaled:
+        # Update bounding box from this mesh's scaled vertices
+        for i in range(0, len(scaled) - 2, 3):
+            x, y, z = scaled[i], scaled[i + 1], scaled[i + 2]
+            if x < xmin: xmin = x
+            if x > xmax: xmax = x
+            if y < ymin: ymin = y
+            if y > ymax: ymax = y
+            if z < zmin: zmin = z
+
+    if not has_verts:
         return None, None
 
-    ox, oy, oz = compute_origin(all_scaled)
+    ox = (xmin + xmax) / 2.0
+    oy = (ymin + ymax) / 2.0
+    oz = zmin
 
     # ------------------------------------------------------------------ #
-    # Pass 2: one faceset per mesh — reuse cached verts, only unpack faces
+    # Pass 2: one faceset per mesh -- reuse cached verts, only unpack faces
     # ------------------------------------------------------------------ #
     geom_items = []
 
-    for mesh, cached in zip(meshes, mesh_cache):
-        if cached is None:
+    for mesh, scaled in zip(meshes, mesh_cache):
+        if scaled is None:
             continue
-        verts, ms, scaled = cached
         raw_faces = _get(mesh, "faces") or []
         faces_raw = unwrap_chunks(raw_faces if isinstance(raw_faces, list) else list(raw_faces))
 
@@ -575,7 +404,7 @@ def mesh_to_ifc(
         try:
             face_groups = decode_faces(faces_raw)
         except Exception as e:
-            print(f"  ⚠️  Face decode error: {e}")
+            print(f"  Warning: Face decode error: {e}")
             continue
 
         # Offset pre-scaled vertices relative to origin (flat list, no tuples)
@@ -592,8 +421,9 @@ def mesh_to_ifc(
             continue
 
         # Apply material style to every faceset of this mesh
+        # Inner meshes (from BrepX) may lack applicationId -- fall back to parent's
         if material_manager:
-            mesh_app_id = _get(mesh, "applicationId")
+            mesh_app_id = _get(mesh, "applicationId") or obj_app_id
             if mesh_app_id:
                 for fs in mesh_facesets:
                     material_manager.apply_to_item(fs, str(mesh_app_id))
