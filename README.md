@@ -1,10 +1,14 @@
-# Speckle-Revit to IFC 4.3 Exporter
+# Speckle → IFC 4.3 Exporter (Revit)
 
 ## 🚧 Project Status: WIP
 Hey there! This project is still under active development, so expect changes, bugs, and incomplete features.
-If you have any questions or suggestions, don’t hesitate to reach out at: **your@email.com**
+If you have any questions or suggestions, don’t hesitate to reach out at: **nikos@speckle.systems**
 
-A [Speckle Automate](https://automate.speckle.dev/) function that converts Speckle Revit models into IFC 4.3 files using [ifcopenshell](https://ifcopenshell.org/). This exporter is specifically designed for models sent to Speckle from Autodesk Revit and relies on Revit-specific object structures, categories, and parameters.
+A [Speckle Automate](https://docs.speckle.systems/developers/automate/introduction) function that converts Speckle models from Revit into IFC 4X3 files using [ifcopenshell](https://ifcopenshell.org/). This exporter is specifically designed for models sent to Speckle from Autodesk Revit and relies on Revit-specific object structures, categories, and parameters.
+
+> ⚠️ **Note on Model Uploads**
+>
+> Large models (greater than 200MB) may fail to upload due to current file size limitations. The team is actively working on resolving this issue.
 
 ## What It Does
 
