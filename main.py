@@ -292,7 +292,7 @@ def _create_element(ifc, ifc_class, name, rep, placement, storey,
     # IfcSpace is a spatial structure element — must be decomposed (aggregated)
     # under its IfcBuildingStorey, not spatially contained.
     if storey_manager:
-        if ifc_class in ("IfcSite", "IfcSpace"):
+        if ifc_class in ("IfcSite", "IfcSpace", "IfcRoad", "IfcBridge", "IfcRailway", "IfcMarineFacility"):
             storey_manager.queue_aggregate(storey, element)
         else:
             storey_manager.queue_contain(storey, element)
